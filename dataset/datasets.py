@@ -1,5 +1,4 @@
 import hashlib
-import logging
 import os
 from typing import Literal, Tuple
 
@@ -8,9 +7,6 @@ import pandas as pd
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 from torch.utils.data import Dataset
 from tqdm import tqdm
-from tqdm.contrib.logging import logging_redirect_tqdm
-
-_logger = logging.getLogger(__name__)
 
 _PYTHON_CACHE_DIR = '__pycache__'
 
@@ -55,35 +51,33 @@ class RandomTextImageDataset(Dataset):
     def _load_ttfs(self):
         ttfs = []
         ignored_fonts = 0
-        with logging_redirect_tqdm():
-            for index, row in tqdm(self._fonts.iterrows(), desc="Loading & validating fonts"):
-                file = row["file"]
-                supported_charset = row["supported_charset"].replace(" ", "")
+        for index, row in tqdm(self._fonts.iterrows(), total=len(self._fonts), desc="Loading & validating fonts"):
+            file = row["file"]
+            supported_charset = row["supported_charset"].replace(" ", "")
 
-                try:
-                    font_path = os.path.join(self.fonts_dir, file)
-                    ttf = ImageFont.truetype(font_path, self.font_size, encoding="unic")
-                except Exception as e:
-                    _logger.error(f"Failed to open {font_path} as TrueType font with exception \"{e}\"")
+            try:
+                font_path = os.path.join(self.fonts_dir, file)
+                ttf = ImageFont.truetype(font_path, self.font_size, encoding="unic")
+            except Exception as e:
+                tqdm.write(f"ERROR: Failed to open {font_path} as TrueType font with exception \"{e}\"")
 
-                    self._fonts.drop(index, inplace=True)
-                    continue
+                self._fonts.drop(index, inplace=True)
+                continue
 
-                unsupported_chars = _check_font_charset_support(ttf, supported_charset)
-                if len(unsupported_chars) > 0:
-                    _logger.warning(
-                        f"Font {file} ignored from fonts list because it does not support {unsupported_chars} from charset"
-                    )
+            unsupported_chars = _check_font_charset_support(ttf, supported_charset)
+            if len(unsupported_chars) > 0:
+                tqdm.write(
+                    f"WARN: Font {file} ignored from fonts list because it does not support {unsupported_chars} from charset"
+                )
 
-                    self._fonts.drop(index, inplace=True)
-                    ignored_fonts += 1
-                    continue
+                self._fonts.drop(index, inplace=True)
+                ignored_fonts += 1
+                continue
 
-                ttfs.append(ttf)
+            ttfs.append(ttf)
 
-            _logger.info(
-                f"Loaded {len(ttfs)} fonts, ignored {ignored_fonts}")
-            self._ttfs = ttfs
+        tqdm.write(f"Loaded {len(ttfs)} fonts, ignored {ignored_fonts}")
+        self._ttfs = ttfs
 
     def _prepare_font_fingerprint_cache(self):
         if self._use_cache:
@@ -96,22 +90,21 @@ class RandomTextImageDataset(Dataset):
             cache_path = os.path.join(
                 _PYTHON_CACHE_DIR, f"ff_{cache_hash}.npy")
             if os.path.exists(cache_path):
-                _logger.info(
+                print(
                     f"Font fingerprints cache found at {cache_path}, loading from cache")
 
                 self._fingerprint_cache = np.load(cache_path, allow_pickle=True)
                 return
 
         self._fingerprint_cache = []
-        with logging_redirect_tqdm():
-            for index, row in tqdm(self._fonts.iterrows(), desc="Generating font fingerprints"):
-                _logger.info(row["font"])
+        for index, row in tqdm(self._fonts.iterrows(), total=len(self._fonts), desc="Generating font fingerprints"):
+            tqdm.write(row["font"])
 
-                self._fingerprint_cache.append(self.generate_font_fingerprint(index))
+            self._fingerprint_cache.append(self.generate_font_fingerprint(index))
 
         if self._use_cache:
             # Save fingerprints numpy array to cache
-            _logger.info(f"Saving font fingerprints cache to {cache_path}")
+            print(f"Saving font fingerprints cache to {cache_path}")
             os.makedirs(_PYTHON_CACHE_DIR, exist_ok=True)
             np.save(cache_path, self._fingerprint_cache)
 
@@ -164,8 +157,8 @@ class RandomTextImageDataset(Dataset):
             img = ImageOps.pad(img, dims, method=Image.LANCZOS,
                                centering=centering)
         except Exception as e:
-            _logger.error(
-                f"Rendering text \"{text}\" with font \"{font}\" failed with exception \"{e}\"")
+            print(
+                f"ERROR: Rendering text \"{text}\" with font \"{font}\" failed with exception \"{e}\"")
             img = Image.new("L", dims, 0)
 
         return np.array(img)
