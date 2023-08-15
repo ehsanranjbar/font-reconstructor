@@ -1,33 +1,48 @@
 {
-    "name": "Mnist_LeNet",
+    "name": "AE_256",
     "n_gpu": 1,
-
     "arch": {
-        "type": "MnistModel",
-        "args": {}
+        "type": "AE",
+        "args": {
+            "latent_dim": 256
+        }
     },
     "data_loader": {
-        "type": "MnistDataLoader",
-        "args":{
-            "data_dir": "data/",
+        "type": "RTIDataLoader",
+        "args": {
+            "fonts_dir": "data/fonts",
+            "annotation_file": "data/fonts.csv",
+            "random_seed": 42,
+            "total_samples": 1000000,
+            "font_size": 32,
+            "text_length": [
+                3,
+                8
+            ],
+            "text_image_dims": [
+                128,
+                32
+            ],
+            "font_fingerprint_dims": [
+                32,
+                32
+            ],
             "batch_size": 128,
             "shuffle": true,
             "validation_split": 0.1,
-            "num_workers": 2
+            "num_workers": 12
         }
     },
     "optimizer": {
         "type": "Adam",
-        "args":{
+        "args": {
             "lr": 0.001,
             "weight_decay": 0,
             "amsgrad": true
         }
     },
-    "loss": "nll_loss",
-    "metrics": [
-        "accuracy", "top_k_acc"
-    ],
+    "loss": "mse_loss",
+    "metrics": [],
     "lr_scheduler": {
         "type": "StepLR",
         "args": {
@@ -36,15 +51,12 @@
         }
     },
     "trainer": {
-        "epochs": 100,
-
+        "epochs": 200,
         "save_dir": "saved/",
         "save_period": 1,
         "verbosity": 2,
-        
         "monitor": "min val_loss",
         "early_stop": 10,
-
         "tensorboard": true
     }
 }

@@ -117,7 +117,7 @@ class RandomTextImageDataset(Dataset):
 
     def generate_font_fingerprint(self, font_index):
         fingerprint = np.zeros(
-            (self._font_fingerprint_length, *self.font_fingerprint_dims), dtype=np.uint8
+            (*self.font_fingerprint_dims, self._font_fingerprint_length), dtype=np.uint8
         )
         supported_charset = self._fonts.iloc[font_index]["supported_charset"].replace(" ", "")
         for i, char in enumerate(supported_charset):
@@ -125,7 +125,7 @@ class RandomTextImageDataset(Dataset):
             if char == "\0":
                 continue
 
-            fingerprint[i, ] = self._generate_text_image(
+            fingerprint[:, :, i] = self._generate_text_image(
                 font_index,
                 char,
                 self.font_fingerprint_dims,
@@ -182,6 +182,7 @@ class RandomTextImageDataset(Dataset):
 
         # Select a random index for font
         font_index = rand.randint(0, len(self._fonts))
+        font = self._fonts.iloc[font_index]["font"]
 
         # Generate a random text using the supported charset of font
         supported_charset = self._fonts.iloc[font_index]["supported_charset"]
@@ -189,7 +190,15 @@ class RandomTextImageDataset(Dataset):
 
         text_image = self._generate_text_image(font_index, text, self.text_image_dims)
 
-        return text_image, self._fingerprint_cache[font_index]
+        X, y = text_image, self._fingerprint_cache[font_index]
+
+        if self.transform:
+            X = self.transform(X)
+
+        if self.target_transform:
+            y = self.target_transform(y)
+
+        return X, y, text, font
 
 
 def _check_font_charset_support(ttf, supported_charset):

@@ -1,6 +1,8 @@
-import torch
 from abc import abstractmethod
+
+import torch
 from numpy import inf
+
 from logger import TensorboardWriter
 
 
@@ -8,6 +10,7 @@ class BaseTrainer:
     """
     Base class for all trainers
     """
+
     def __init__(self, model, criterion, metric_ftns, optimizer, config):
         self.config = config
         self.logger = config.get_logger('trainer', config['trainer']['verbosity'])
@@ -39,7 +42,7 @@ class BaseTrainer:
 
         self.checkpoint_dir = config.save_dir
 
-        # setup visualization writer instance                
+        # setup visualization writer instance
         self.writer = TensorboardWriter(config.log_dir, self.logger, cfg_trainer['tensorboard'])
 
         if config.resume is not None:
@@ -60,10 +63,27 @@ class BaseTrainer:
         """
         not_improved_count = 0
         for epoch in range(self.start_epoch, self.epochs + 1):
+            # set step of tensorboard writer
+            self.writer.set_step(epoch)
+
             result = self._train_epoch(epoch)
 
+            # add optimizer lr to tensorboard
+            self.writer.add_scalar('learning_rate', self.optimizer.param_groups[0]['lr'])
+            # add train and validation metrics in the same plot
+            for key, value in result.items():
+                if not key.startswith('val_'):
+                    self.writer.add_scalar(key + '/train', value)
+                    self.writer.add_scalar(key + '/val', result['val_' + key])
+            # add histogram of model parameters to the tensorboard
+            for name, p in self.model.named_parameters():
+                self.writer.add_histogram(name, p, bins='auto')
+
             # save logged informations into log dict
-            log = {'epoch': epoch}
+            log = {
+                'epoch': epoch,
+                'lr': self.optimizer.param_groups[0]['lr']
+            }
             log.update(result)
 
             # print logged informations to the screen
