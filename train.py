@@ -25,6 +25,7 @@ def main(config):
     # setup data_loader instances
     data_loader = config.init_obj('data_loader', module_data)
     valid_data_loader = data_loader.split_validation()
+    clustering_data_loader = config.init_obj('clustering_data_loader', module_data)
 
     # build model architecture, then print to console
     model = config.init_obj('arch', module_arch)
@@ -50,6 +51,7 @@ def main(config):
                       device=device,
                       data_loader=data_loader,
                       valid_data_loader=valid_data_loader,
+                      clustering_data_loader=clustering_data_loader,
                       lr_scheduler=lr_scheduler)
 
     trainer.train()

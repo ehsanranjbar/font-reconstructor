@@ -72,9 +72,7 @@ class BaseTrainer:
             self.writer.add_scalar('learning_rate', self.optimizer.param_groups[0]['lr'])
             # add train and validation metrics in the same plot
             for key, value in result.items():
-                if not key.startswith('val_'):
-                    self.writer.add_scalar(key + '/train', value)
-                    self.writer.add_scalar(key + '/val', result['val_' + key])
+                self.writer.add_scalar(key.removeprefix('val_') + '/' + ('val' if key.startswith('val_') else 'train'), value)
             # add histogram of model parameters to the tensorboard
             for name, p in self.model.named_parameters():
                 self.writer.add_histogram(name, p, bins='auto')

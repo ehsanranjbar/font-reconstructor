@@ -1,10 +1,11 @@
 {
-    "name": "AE_256",
+    "name": "AE2_256",
     "n_gpu": 1,
     "arch": {
-        "type": "AE",
+        "type": "AE2",
         "args": {
-            "latent_dim": 256
+            "latent_dim": 256,
+            "batch_norm": false
         }
     },
     "data_loader": {
@@ -30,7 +31,37 @@
             "batch_size": 128,
             "shuffle": true,
             "validation_split": 0.1,
-            "num_workers": 12
+            "num_workers": 12,
+            "pin_memory": true
+        }
+    },
+    "clustering_data_loader": {
+        "type": "RTIDataLoader",
+        "args": {
+            "fonts_dir": "data/fonts",
+            "annotation_file": "data/fonts.csv",
+            "random_seed": 123,
+            "total_samples": 1153000,
+            "font_size": 32,
+            "text_length": [
+                3,
+                8
+            ],
+            "text_image_dims": [
+                128,
+                32
+            ],
+            "font_fingerprint_dims": [
+                32,
+                32
+            ],
+            "group_by_font": true,
+            "random_augmentions": false,
+            "batch_size": 128,
+            "shuffle": false,
+            "validation_split": 0.0,
+            "num_workers": 12,
+            "pin_memory": true
         }
     },
     "optimizer": {

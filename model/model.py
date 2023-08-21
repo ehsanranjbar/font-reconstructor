@@ -46,3 +46,66 @@ class AE(BaseModel):
 
     def forward(self, x):
         return self.decoder(self.encoder(x))
+
+
+class AE2(BaseModel):
+    def __init__(
+            self,
+            kernel_size=3,
+            base_conv_filters=16,
+            batch_norm=False,
+            latent_dim=128,
+            decoder_output_channels=42,
+    ):
+        super().__init__()
+
+        self.encoder = nn.Sequential()
+        for i in range(6):
+            layer = OrderedDict()
+            layer['conv2d'] = nn.Conv2d(
+                in_channels=1 if i == 0 else base_conv_filters * 2 ** (i - 1),
+                out_channels=base_conv_filters * 2 ** i,
+                kernel_size=kernel_size,
+                stride=2,
+                padding=1,
+                bias=not batch_norm,
+            )
+            if batch_norm:
+                layer['batch_norm'] = nn.BatchNorm2d(base_conv_filters * 2 ** i)
+            layer['leaky_relu'] = nn.LeakyReLU(0.2, inplace=True)
+
+            self.encoder.add_module(f'conv_layer_{i}', nn.Sequential(layer))
+        self.encoder.add_module('flatten', nn.Flatten())
+        self.encoder.add_module('fc', nn.Linear(256 * 1 * 4, latent_dim))
+
+        self.decoder = nn.Sequential()
+        self.decoder.add_module('fc', nn.Linear(latent_dim, 512 * 1 * 4))
+        self.decoder.add_module('unflatten', nn.Unflatten(1, (512, 2, 2)))
+        for i in range(3):
+            layer = OrderedDict()
+            layer['conv_transposed_2d'] = nn.ConvTranspose2d(
+                in_channels=base_conv_filters * 2 ** (5 - i),
+                out_channels=base_conv_filters * 2 ** (4 - i),
+                kernel_size=kernel_size,
+                stride=2,
+                padding=1,
+                output_padding=1,
+                bias=not batch_norm,
+            )
+            if batch_norm:
+                layer['batch_norm'] = nn.BatchNorm2d(base_conv_filters * 2 ** (4 - i))
+            layer['leaky_relu'] = nn.LeakyReLU(0.2, inplace=True)
+
+            self.decoder.add_module(f't_conv_layer_{i}', nn.Sequential(layer))
+        self.decoder.add_module('conv_transposed_2d', nn.ConvTranspose2d(
+            in_channels=base_conv_filters * 4,
+            out_channels=decoder_output_channels,
+            kernel_size=kernel_size,
+            stride=2,
+            padding=1,
+            output_padding=1,
+        ))
+        self.decoder.add_module('tanh', nn.Tanh())
+
+    def forward(self, x):
+        return self.decoder(self.encoder(x))

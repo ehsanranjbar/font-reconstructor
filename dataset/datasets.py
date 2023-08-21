@@ -1,4 +1,5 @@
 import hashlib
+import math
 import os
 from typing import Literal, Tuple
 
@@ -24,7 +25,9 @@ class RandomTextImageDataset(Dataset):
         font_fingerprint_dims: Tuple[int, int] = (32, 32),
         transform=None,
         target_transform=None,
-        use_cache: bool = True,
+        group_by_font: bool = False,
+        cache_fingerprints: bool = True,
+        cache_images: bool = True,
     ):
         self.fonts_dir = fonts_dir
         self._fonts = pd.read_csv(annotation_file)
@@ -36,14 +39,21 @@ class RandomTextImageDataset(Dataset):
         self.font_fingerprint_dims = font_fingerprint_dims
         self.transform = transform
         self.target_transform = target_transform
-        self._use_cache = use_cache
+        self._group_by_font = group_by_font
+        self._cache_fingerprints = cache_fingerprints
+        self._cache_images = cache_images
 
         if self.random_seed is None:
             self.random_seed = np.random.randint()
 
         self._font_fingerprint_length = self._calc_font_fingerprint_length()
         self._load_ttfs()
-        self._prepare_font_fingerprint_cache()
+
+        if self._cache_fingerprints:
+            self._prepare_font_fingerprint_cache()
+
+        if self._cache_images:
+            self._prepare_images_cache()
 
     def _calc_font_fingerprint_length(self):
         return max([len(charset.replace(" ", "")) for charset in self._fonts["supported_charset"]])
@@ -80,21 +90,20 @@ class RandomTextImageDataset(Dataset):
         self._ttfs = ttfs
 
     def _prepare_font_fingerprint_cache(self):
-        if self._use_cache:
-            # Get shorted md5 hash of fonts dataframe and font size
-            cache_hash = hashlib.md5(pd.util.hash_pandas_object(self._fonts, index=True).to_numpy().tobytes())
-            cache_hash.update(str(self.font_size).encode("utf-8"))
-            cache_hash = cache_hash.hexdigest()[:8]
+        # Get shorted md5 hash of fonts dataframe and font size
+        cache_hash = hashlib.md5(pd.util.hash_pandas_object(self._fonts, index=True).to_numpy().tobytes())
+        cache_hash.update(str(self.font_size).encode("utf-8"))
+        cache_hash = cache_hash.hexdigest()[:8]
 
-            # Retrieve fingerprints numpy array from cache if available
-            cache_path = os.path.join(
-                _PYTHON_CACHE_DIR, f"ff_{cache_hash}.npy")
-            if os.path.exists(cache_path):
-                print(
-                    f"Font fingerprints cache found at {cache_path}, loading from cache")
+        # Retrieve fingerprints numpy array from cache if available
+        cache_path = os.path.join(
+            _PYTHON_CACHE_DIR, f"ff_{cache_hash}.npy")
+        if os.path.exists(cache_path):
+            print(
+                f"Font fingerprints cache found at {cache_path}, loading from cache")
 
-                self._fingerprint_cache = np.load(cache_path, allow_pickle=True)
-                return
+            self._fingerprint_cache = np.load(cache_path, allow_pickle=True)
+            return
 
         self._fingerprint_cache = []
         for index, row in tqdm(self._fonts.iterrows(), total=len(self._fonts), desc="Generating font fingerprints"):
@@ -102,11 +111,10 @@ class RandomTextImageDataset(Dataset):
 
             self._fingerprint_cache.append(self.generate_font_fingerprint(index))
 
-        if self._use_cache:
-            # Save fingerprints numpy array to cache
-            print(f"Saving font fingerprints cache to {cache_path}")
-            os.makedirs(_PYTHON_CACHE_DIR, exist_ok=True)
-            np.save(cache_path, self._fingerprint_cache)
+        # Save fingerprints numpy array to cache
+        print(f"Saving font fingerprints cache to {cache_path}")
+        os.makedirs(_PYTHON_CACHE_DIR, exist_ok=True)
+        np.save(cache_path, self._fingerprint_cache)
 
     def generate_font_fingerprint(self, font_index):
         fingerprint = np.zeros(
@@ -163,6 +171,46 @@ class RandomTextImageDataset(Dataset):
 
         return np.array(img)
 
+    def _prepare_images_cache(self):
+        # Get shorted md5 hash of self properties
+        cache_hash = hashlib.md5()
+        cache_hash.update(pd.util.hash_pandas_object(self._fonts, index=True).to_numpy().tobytes())
+        cache_hash.update(str(self.random_seed).encode("utf-8"))
+        cache_hash.update(str(self.total_samples).encode("utf-8"))
+        cache_hash.update(str(self.font_size).encode("utf-8"))
+        cache_hash.update(str(self.text_length).encode("utf-8"))
+        cache_hash.update(str(self.text_image_dims).encode("utf-8"))
+        cache_hash.update(str(self.font_fingerprint_dims).encode("utf-8"))
+        cache_hash.update(str(self._group_by_font).encode("utf-8"))
+        cache_hash = cache_hash.hexdigest()[:8]
+
+        # Retrieve images numpy array from cache if available
+        cache_path = os.path.join(
+            _PYTHON_CACHE_DIR, f"im_{cache_hash}.npy")
+        if os.path.exists(cache_path):
+            print(
+                f"Text images cache found at {cache_path}, loading from cache")
+
+            self._images_cache = np.load(cache_path, allow_pickle=True)
+            return
+
+        self._cache_images = False
+        transform = self.transform
+        target_transform = self.target_transform
+        self.transform = None
+        self.target_transform = None
+        self._images_cache = []
+        for (img, _, _, _) in tqdm(self, total=self.total_samples, desc="Generating text images"):
+            self._images_cache.append(img)
+        self._cache_images = True
+        self.transform = transform
+        self.target_transform = target_transform
+
+        # Save images numpy array to cache
+        print(f"Saving text images cache to {cache_path}")
+        os.makedirs(_PYTHON_CACHE_DIR, exist_ok=True)
+        np.save(cache_path, self._images_cache)
+
     def __len__(self):
         return self.total_samples
 
@@ -171,27 +219,41 @@ class RandomTextImageDataset(Dataset):
             raise IndexError
 
         # Generate a random generator from the dataset's random seed and index
-        rand = np.random.RandomState(self.random_seed + idx)
-
-        # Select a random index for font
-        font_index = rand.randint(0, len(self._fonts))
-        font = self._fonts.iloc[font_index]["font"]
+        if self._group_by_font:
+            rand = np.random.RandomState(self.random_seed + math.floor(idx / len(self._fonts)))
+            font_index = idx % len(self._fonts)
+        else:
+            rand = np.random.RandomState(self.random_seed + idx)
+            font_index = rand.randint(0, len(self._fonts))
 
         # Generate a random text using the supported charset of font
         supported_charset = self._fonts.iloc[font_index]["supported_charset"]
         text = _generate_rand_text(rand, self.text_length, supported_charset)
+        X = self._get_text_image(text, font_index, idx=idx)
 
-        text_image = self._generate_text_image(font_index, text, self.text_image_dims)
+        y = self._get_font_fingerprint(font_index)
 
-        X, y = text_image, self._fingerprint_cache[font_index]
+        font = self._fonts.iloc[font_index]["font"]
 
-        if self.transform:
+        if self.transform is not None:
             X = self.transform(X)
 
-        if self.target_transform:
+        if self.target_transform is not None:
             y = self.target_transform(y)
 
         return X, y, text, font
+
+    def _get_text_image(self, text, font_index, idx=None):
+        if self._cache_images and idx is not None:
+            return self._images_cache[idx]
+        else:
+            return self._generate_text_image(font_index, text, self.text_image_dims)
+
+    def _get_font_fingerprint(self, font_index):
+        if self._cache_fingerprints:
+            return self._fingerprint_cache[font_index]
+        else:
+            return self.generate_font_fingerprint(font_index)
 
 
 def _check_font_charset_support(ttf, supported_charset):

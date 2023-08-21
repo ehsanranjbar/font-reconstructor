@@ -3,9 +3,11 @@ from collections import OrderedDict
 from copy import deepcopy
 from itertools import repeat
 from pathlib import Path
+import numpy as np
 
 import pandas as pd
 import torch
+import torch.nn.functional as F
 
 
 def ensure_dir(dirname):
@@ -75,3 +77,31 @@ class MetricTracker:
 
     def result(self):
         return dict(self._data.average)
+
+
+class TopKCosimAccuracy():
+    """
+    This class calculates clusters for each label of dataset base on averaging
+    the embedding of random samples of each label. Then, it calculates the
+    accuracy of the model by comparing the output of the model with the
+    clusters. The model is assumed to be accurate if true label is in top k most cosine similar clusters of the output.
+    """
+
+    def __init__(self, clusters, labels):
+        self.clusters = F.normalize(clusters).transpose(0, 1)
+        self.labels = labels
+
+    def __call__(self, output, target, k=[5]):
+        # find index of elements in target corresponding to labels
+        target = np.searchsorted(self.labels, target)
+        acc = np.zeros(shape=(len(k), output.shape[0]))
+        with torch.no_grad():
+            cosim = F.normalize(output) @ self.clusters
+
+            for i, k in enumerate(k):
+                _, topk = torch.topk(cosim, k)
+                for j in range(output.shape[0]):
+                    if target[j] in topk[j]:
+                        acc[i, j] = 1
+
+            return acc.mean(axis=1)

@@ -3,6 +3,7 @@ import math
 import arabic_reshaper
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import torch
 from bidi.algorithm import get_display
 from matplotlib import colors
@@ -10,7 +11,7 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 from tqdm import tqdm
 
 from base import BaseTrainer
-from utils import MetricTracker, inf_loop, move_model_to_cpu
+from utils import MetricTracker, TopKCosimAccuracy, inf_loop, move_model_to_cpu
 
 
 class Trainer(BaseTrainer):
@@ -19,7 +20,7 @@ class Trainer(BaseTrainer):
     """
 
     def __init__(self, model, criterion, metric_ftns, optimizer, config, device,
-                 data_loader, valid_data_loader=None, lr_scheduler=None, len_epoch=None):
+                 data_loader, valid_data_loader=None, clustering_data_loader=None, lr_scheduler=None, len_epoch=None):
         super().__init__(model, criterion, metric_ftns, optimizer, config)
         self.config = config
         self.device = device
@@ -32,12 +33,13 @@ class Trainer(BaseTrainer):
             self.data_loader = inf_loop(data_loader)
             self.len_epoch = len_epoch
         self.valid_data_loader = valid_data_loader
+        self.clustering_data_loader = clustering_data_loader
         self.do_validation = self.valid_data_loader is not None
         self.lr_scheduler = lr_scheduler
         self.log_step = int(np.sqrt(data_loader.batch_size))
 
         self.train_metrics = MetricTracker('loss', *[m.__name__ for m in self.metric_ftns])
-        self.valid_metrics = MetricTracker('loss', *[m.__name__ for m in self.metric_ftns])
+        self.valid_metrics = MetricTracker('loss', 'top5_acc', 'top10_acc', *[m.__name__ for m in self.metric_ftns])
 
     def _train_epoch(self, epoch):
         """
@@ -72,6 +74,8 @@ class Trainer(BaseTrainer):
         log = self.train_metrics.result()
 
         if self.do_validation:
+            clusters, labels = self._calculate_cluster_labels(epoch)
+            self.topk_acc = TopKCosimAccuracy(clusters, labels)
             val_log = self._valid_epoch(epoch)
             log.update(**{'val_' + k: v for k, v in val_log.items()})
 
@@ -82,6 +86,29 @@ class Trainer(BaseTrainer):
                 self.lr_scheduler.step()
         return log
 
+    def _calculate_cluster_labels(self, epoch):
+        self.model.eval()
+        epoch_embedings = []
+        epoch_fonts = []
+        eval_loop = tqdm(self.clustering_data_loader, desc='    Clustering Labels')
+        with torch.no_grad():
+            for (data, _, _, font) in eval_loop:
+                data = data.to(self.device)
+
+                latent = self.model.encoder(data)
+                epoch_embedings.append(latent)
+                epoch_fonts.extend(font)
+
+        epoch_embedings = torch.cat(epoch_embedings, dim=0).cpu().numpy()
+        df = pd.DataFrame(epoch_embedings, columns=[f'x_{i}' for i in range(epoch_embedings.shape[1])])
+        df['font'] = epoch_fonts
+        df.dropna(inplace=True)
+        clusters_df = df.groupby("font").mean().sort_index()
+
+        clusters = torch.tensor(clusters_df.values, dtype=torch.float32, device=self.device)
+        fonts = clusters_df.index.values
+        return clusters, fonts
+
     def _valid_epoch(self, epoch):
         """
         Validate after training an epoch
@@ -91,10 +118,11 @@ class Trainer(BaseTrainer):
         """
         self.model.eval()
         self.valid_metrics.reset()
-        embedings = []
-        fonts = []
+        epoch_embedings = []
+        epoch_fonts = []
+        valid_loop = tqdm(self.valid_data_loader, desc='    Validation')
         with torch.no_grad():
-            for batch_idx, (data, target, text, font) in enumerate(self.valid_data_loader):
+            for batch_idx, (data, target, text, font) in enumerate(valid_loop):
                 data, target = data.to(self.device), target.to(self.device)
 
                 latent = self.model.encoder(data)
@@ -102,21 +130,25 @@ class Trainer(BaseTrainer):
                 loss = self.criterion(output, target)
 
                 self.valid_metrics.update('loss', loss.item())
+                top5_acc, top10_acc = self.topk_acc(latent, font, k=[5, 10])
+                self.valid_metrics.update('top5_acc', top5_acc)
+                self.valid_metrics.update('top10_acc', top10_acc)
                 for met in self.metric_ftns:
                     self.valid_metrics.update(met.__name__, met(output, target))
 
                 if epoch % math.ceil(self.epochs / 8) == 0:
-                    embedings.append(latent)
-                    fonts.extend(font)
+                    epoch_embedings.append(latent)
+                    epoch_fonts.extend(font)
 
-                if batch_idx == 0:
+                # add figure of samples from validation set at end of each epoch
+                if batch_idx == len(self.valid_data_loader) - 1:
                     self._samples_figure(data, target, latent, output, text, font)
 
             # add embedding to tensorboard
             # we can only add embedding 8 times to the tensorboard so we do this every (self.epochs / 8)
             if epoch % math.ceil(self.epochs / 8) == 0:
-                embedings = torch.cat(embedings, dim=0)
-                self.writer.add_embedding(embedings, metadata=fonts, global_step=epoch)
+                epoch_embedings = torch.cat(epoch_embedings, dim=0)
+                self.writer.add_embedding(epoch_embedings, metadata=epoch_fonts, global_step=epoch)
 
         return self.valid_metrics.result()
 
