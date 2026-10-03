@@ -13,8 +13,8 @@ def main(config):
     """
     Evaluate a checkpoint on clean (not augmented) samples.
 
-    The validation split of the training data is used. If the config holds out no validation split, the
-    whole dataset is used instead.
+    The fonts held out for validation are used, which the model never trained on. Each of them is identified
+    among all fonts. If the config holds out no fonts, the training data is used instead.
 
     :return: dict of the loss, metrics and top-k accuracies
     """
@@ -27,10 +27,11 @@ def main(config):
 
     # setup data_loader instances
     fonts = factory.build_fontset(config)
+    corpus = factory.build_corpus(config)
     train_loader, valid_loader = factory.build_train_valid_loaders(
-        config, fonts, device, shuffle=False, random_augmentations=False)
+        config, fonts, device, corpus, shuffle=False, random_augmentations=False)
     data_loader = valid_loader if valid_loader is not None else train_loader
-    clustering_data_loader = factory.build_clustering_loader(config, fonts, device)
+    clustering_data_loader = factory.build_clustering_loader(config, fonts, device, corpus)
 
     # build model architecture
     model = factory.build_model(config, fonts)

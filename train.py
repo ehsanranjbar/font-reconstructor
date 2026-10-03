@@ -21,8 +21,14 @@ def main(config):
 
     # setup data_loader instances
     fonts = factory.build_fontset(config)
-    data_loader, valid_data_loader = factory.build_train_valid_loaders(config, fonts, device)
-    clustering_data_loader = factory.build_clustering_loader(config, fonts, device)
+    corpus = factory.build_corpus(config)
+    data_loader, valid_data_loader = factory.build_train_valid_loaders(config, fonts, device, corpus)
+    clustering_data_loader = factory.build_clustering_loader(config, fonts, device, corpus)
+    n_valid_fonts = 0 if valid_data_loader is None else len(valid_data_loader.dataset.dataset.font_indices)
+    logger.info('Fonts: {} for training, {} held out for validation'.format(
+        len(data_loader.dataset.dataset.font_indices), n_valid_fonts))
+    logger.info('Styles: {}'.format(', '.join(
+        '{} ({})'.format(name, fonts.styles.count(name)) for name in fonts.style_names)))
 
     # build model architecture, then print to console
     model = factory.build_model(config, fonts)
@@ -35,6 +41,7 @@ def main(config):
 
     # get function handles of loss and metrics
     criterion = factory.build_criterion(config)
+    contrastive_criterion, contrastive_weight = factory.build_contrastive(config)
     metrics = factory.build_metrics(config)
 
     # build optimizer, learning rate scheduler. delete every lines containing lr_scheduler for disabling scheduler
@@ -49,7 +56,11 @@ def main(config):
                       valid_data_loader=valid_data_loader,
                       clustering_data_loader=clustering_data_loader,
                       num_fonts=len(fonts),
-                      lr_scheduler=lr_scheduler)
+                      lr_scheduler=lr_scheduler,
+                      contrastive_criterion=contrastive_criterion,
+                      contrastive_weight=contrastive_weight,
+                      **factory.build_adversarial(config, fonts, device),
+                      **factory.build_style_head(config))
 
     trainer.train()
 

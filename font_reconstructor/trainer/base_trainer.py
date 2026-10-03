@@ -46,6 +46,7 @@ class BaseTrainer:
                 self.early_stop = inf
 
         self.start_epoch = 1
+        self._extras_to_load = {}
 
         self.checkpoint_dir = config.save_dir
 
@@ -139,7 +140,8 @@ class BaseTrainer:
             'optimizer': self.optimizer.state_dict(),
             'monitor_best': self.mnt_best,
             # the plain config dict, so that loading a checkpoint does not depend on the classes of this project
-            'config': _to_plain(self.config.config)
+            'config': _to_plain(self.config.config),
+            'extras': self._checkpoint_extras(),
         }
         if save_periodic:
             filename = self.checkpoint_dir / 'checkpoint-epoch{}.pth'.format(epoch)
@@ -151,6 +153,15 @@ class BaseTrainer:
             best_path = str(self.checkpoint_dir / 'model_best.pth')
             torch.save(state, best_path)
             self.logger.info("Saving current best: model_best.pth ...")
+
+    def _checkpoint_extras(self):
+        """
+        Further state of a trainer to store in checkpoints, as a dict of plain data and tensors.
+
+        A resumed trainer finds the stored dict in `self._extras_to_load`. It is read there, not passed to a
+        hook, because checkpoints are loaded before a subclass has finished setting itself up.
+        """
+        return {}
 
     def _prune_checkpoints(self):
         """
@@ -188,6 +199,8 @@ class BaseTrainer:
                                 "Optimizer parameters not being resumed.")
         else:
             self.optimizer.load_state_dict(checkpoint['optimizer'])
+
+        self._extras_to_load = checkpoint.get('extras') or {}
 
         self.logger.info("Checkpoint loaded. Resume training from epoch {}".format(self.start_epoch))
 

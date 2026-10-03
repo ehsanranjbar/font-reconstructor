@@ -39,6 +39,26 @@ def fonts(fonts_dir):
     return FontSet(str(root), str(annotation_file), font_size=32)
 
 
+CORPUS_TEXT = """\
+A bad cab, faded!
+head had a bag
+feed a deaf bee
+café bead
+abcdefgh
+dab
+"""
+
+
+@pytest.fixture(scope='session')
+def corpus_file(tmp_path_factory):
+    """
+    a small text file to draw texts from. Its words use the letters a to h, and a few characters outside them.
+    """
+    path = tmp_path_factory.mktemp('corpus') / 'corpus.txt'
+    path.write_text(CORPUS_TEXT, encoding='utf-8')
+    return path
+
+
 def load_script(name):
     """
     import one of the scripts at the repository root as a module

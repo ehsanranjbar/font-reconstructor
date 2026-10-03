@@ -2,19 +2,20 @@
 Builds the objects of a run from its configuration. This is the only module that knows the layout of config.json.
 """
 import warnings
+from functools import partial
 
 import torch
 
 import font_reconstructor.model.loss as module_loss
 import font_reconstructor.model.metric as module_metric
 import font_reconstructor.model.model as module_arch
-from font_reconstructor.dataset import FontSet, make_clustering_loader, make_train_valid_loaders
+from font_reconstructor.dataset import FontSet, TextCorpus, make_clustering_loader, make_train_valid_loaders
 
-_FONTSET_KEYS = ('fonts_dir', 'annotation_file', 'font_size')
-_RENDER_KEYS = ('text_length', 'text_image_dims', 'font_fingerprint_dims', 'cache_dir')
-_DATASET_KEYS = _FONTSET_KEYS + _RENDER_KEYS
+_FONTSET_KEYS = ('fonts_dir', 'annotation_file', 'font_size', 'layout_engine')
+_RENDER_KEYS = ('text_length', 'text_image_dims', 'font_fingerprint_dims', 'number_ratio', 'render_scale', 'cache_dir')
+_DATASET_KEYS = _FONTSET_KEYS + _RENDER_KEYS + ('corpus_files', 'capture')
 # keys of the clustering loader in configs written before the shared `dataset` block, they have no effect anymore
-_LEGACY_CLUSTERING_KEYS = ('group_by_font', 'shuffle', 'validation_split', 'random_augmentations')
+_LEGACY_CLUSTERING_KEYS = ('group_by_font', 'shuffle', 'validation_split')
 
 
 def dataset_config(config):
@@ -50,21 +51,32 @@ def build_fontset(config):
     return FontSet(**{key: cfg[key] for key in _FONTSET_KEYS if key in cfg})
 
 
-def build_train_valid_loaders(config, fonts, device=None, **overrides):
+def build_corpus(config):
+    """
+    :return: the text corpus of the `corpus_files` dataset setting, or None to render random characters
+    """
+    files = dataset_config(config).get('corpus_files')
+    return TextCorpus(files) if files else None
+
+
+def build_train_valid_loaders(config, fonts, device=None, corpus=None, **overrides):
     """
     :param device: device the batches are moved to. Memory is only pinned for CUDA.
+    :param corpus: text corpus of `build_corpus`
     :param overrides: loader arguments that replace those of the config
     """
     cfg = dataset_config(config)
     args = loader_args(config, 'data_loader')
     args.update({key: cfg[key] for key in _RENDER_KEYS if key in cfg})
+    args['capture_options'] = cfg.get('capture')
     args.update(overrides)
     args['pin_memory'] = _pin_memory(args.get('pin_memory', False), device)
-    return make_train_valid_loaders(fonts, **args)
+    return make_train_valid_loaders(fonts, corpus=corpus, **args)
 
 
-def build_clustering_loader(config, fonts, device=None):
+def build_clustering_loader(config, fonts, device=None, corpus=None):
     """
+    :param corpus: text corpus of `build_corpus`
     :return: the clustering loader, or None if the config has no `clustering_data_loader`
     """
     if not config.get('clustering_data_loader'):
@@ -78,9 +90,10 @@ def build_clustering_loader(config, fonts, device=None):
         # configs written before `samples_per_font` give the total over all fonts
         total_samples = args.pop('total_samples')
         args.setdefault('samples_per_font', max(1, total_samples // len(fonts)))
-    args.update({key: cfg[key] for key in ('text_length', 'text_image_dims', 'cache_dir') if key in cfg})
+    args.update({key: cfg[key] for key in _RENDER_KEYS if key in cfg and key != 'font_fingerprint_dims'})
+    args['capture_options'] = cfg.get('capture')
     args['pin_memory'] = _pin_memory(args.get('pin_memory', False), device)
-    return make_clustering_loader(fonts, **args)
+    return make_clustering_loader(fonts, corpus=corpus, **args)
 
 
 def build_model(config, fonts):
@@ -97,6 +110,8 @@ def build_model(config, fonts):
         'input_dims': (text_height, text_width),
         'output_dims': (glyph_height, glyph_width),
     }
+    if build_style_head(config):
+        derived['style_classes'] = len(fonts.style_names)
 
     configured = config['arch']['args']
     kwargs = {}
@@ -133,6 +148,56 @@ def check_model_shapes(model, dataset):
 
 def build_criterion(config):
     return getattr(module_loss, config['loss'])
+
+
+def build_contrastive(config):
+    """
+    The contrastive loss on the latent vector, configured by the `contrastive_loss` block.
+
+    :return: (loss function of (latent, font_index), weight), or (None, 0.0) if it is not configured
+    """
+    cfg = config.get('contrastive_loss') or {}
+    weight = float(cfg.get('weight', 0.0))
+    if not weight:
+        return None, 0.0
+    criterion = partial(module_loss.supervised_contrastive_loss, temperature=cfg.get('temperature', 0.1))
+    return criterion, weight
+
+
+def build_style_head(config):
+    """
+    The style head, configured by the `style_head` block.
+
+    :return: dict of Trainer arguments (style_weight, style_detach), empty if it is not configured
+    """
+    cfg = config.get('style_head') or {}
+    weight = float(cfg.get('weight', 0.0))
+    if not weight:
+        return {}
+    return {'style_weight': weight, 'style_detach': bool(cfg.get('detach', False))}
+
+
+def build_adversarial(config, fonts, device):
+    """
+    The discriminator of the adversarial loss, configured by the `adversarial_loss` block.
+
+    :return: dict of Trainer arguments (discriminator, discriminator_optimizer, adversarial_weight,
+             adversarial_start_epoch), empty if it is not configured
+    """
+    cfg = config.get('adversarial_loss') or {}
+    weight = float(cfg.get('weight', 0.0))
+    if not weight:
+        return {}
+
+    discriminator = module_arch.GlyphDiscriminator(
+        fonts.num_glyphs, base_channels=cfg.get('discriminator_channels', 32)).to(device)
+    optimizer = torch.optim.Adam(discriminator.parameters(), lr=cfg.get('lr', 2e-4), betas=(0.5, 0.999))
+    return {
+        'discriminator': discriminator,
+        'discriminator_optimizer': optimizer,
+        'adversarial_weight': weight,
+        'adversarial_start_epoch': cfg.get('start_epoch', 1),
+    }
 
 
 def build_metrics(config):

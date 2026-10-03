@@ -1,24 +1,30 @@
-from collections import OrderedDict
-from typing import Tuple
+from typing import Optional, Tuple
 
+import torch
 import torch.nn as nn
-
-_ENCODER_LAYERS = 6
-_DECODER_LAYERS = 4
 
 
 class BaseModel(nn.Module):
     """
-    Base class for all models
+    Base class for all models. A model encodes a text image to a latent vector and decodes that to a fingerprint.
     """
 
-    def forward(self, *inputs):
+    def encode(self, x):
+        raise NotImplementedError
+
+    def decode(self, latent):
+        raise NotImplementedError
+
+    def forward(self, x, return_latent=False):
         """
         Forward pass logic
 
-        :return: Model output
+        :param return_latent: also return the latent vector, which losses on the embedding need
+        :return: the reconstructed fingerprint, or (fingerprint, latent) with `return_latent`
         """
-        raise NotImplementedError
+        latent = self.encode(x)
+        output = self.decode(latent)
+        return (output, latent) if return_latent else output
 
     def __str__(self):
         """
@@ -28,127 +34,215 @@ class BaseModel(nn.Module):
         return super().__str__() + '\nTrainable parameters: {}'.format(params)
 
 
-class AutoEncoder(BaseModel):
+class ResidualBlock(nn.Module):
     """
-    Convolutional autoencoder from a text image to the fingerprint of its font.
+    two 3x3 convolutions with a shortcut, the first one strided to downsample
+    """
 
-    The encoder halves the image six times and projects it to a latent vector of `latent_dim`. The decoder
-    doubles a small feature map four times up to the fingerprint, one output channel per glyph.
+    def __init__(self, in_channels: int, out_channels: int, stride: int = 1):
+        super().__init__()
+        self.body = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+        )
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels),
+            )
+        else:
+            self.shortcut = nn.Identity()
+        self.activation = nn.LeakyReLU(0.2, inplace=True)
 
-    :param kernel_size: kernel size of all convolutions. The decoder only reaches `output_dims` with 3.
-    :param base_conv_filters: filters of the first convolution, doubled by each following encoder layer
-    :param batch_norm: add batch normalization after each hidden convolution
+    def forward(self, x):
+        return self.activation(self.body(x) + self.shortcut(x))
+
+
+class UpsampleBlock(nn.Module):
+    """
+    Double the resolution by nearest neighbour resizing followed by a convolution.
+
+    Unlike a strided transposed convolution, every output pixel gets the same number of contributions,
+    which avoids checkerboard artifacts.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.LeakyReLU(0.2, inplace=True),
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class CompactAutoEncoder(BaseModel):
+    """
+    Small residual autoencoder from a text image to the fingerprint of its font.
+
+    The encoder is a stack of residual blocks that each halve the image, followed by global average pooling
+    and a projection to the latent vector. Pooling makes the latent independent of where a stroke sits in the
+    image and of the image width, so texts of any length can be encoded.
+
+    The decoder grows a small feature map to the fingerprint with resize-convolution blocks.
+
+    Only the encoder is needed to identify a font, the decoder is a training aid. That is why the two are
+    sized separately: `base_channels` and `latent_dim` set the cost of using the model, while
+    `decoder_channels` and `decoder_blocks` only make training slower.
+
+    Two kinds of decoder are available with `decoder_type`:
+
+    'joint'        draws all glyphs at once, one output channel per glyph.
+    'conditioned'  draws one glyph at a time from the latent vector and a learned embedding of the character.
+                   All glyphs share its weights, so what it learns about a style applies to every character.
+                   It runs once per glyph, which makes training slower than with the joint decoder.
+
+    :param base_channels: channels of the first encoder stage, doubled by each following stage
     :param latent_dim: size of the latent vector
+    :param encoder_stages: number of downsampling residual blocks
     :param decoder_output_channels: number of glyphs in the font fingerprint
-    :param input_dims: (height, width) of the text image
-    :param output_dims: (height, width) of each glyph of the fingerprint
+    :param input_dims: (height, width) of the text image. Only its minimum size matters.
+    :param output_dims: (height, width) of each glyph of the fingerprint, multiples of 16
+    :param decoder_channels: base width of the decoder, `base_channels` if None
+    :param decoder_blocks: convolution blocks at each resolution of the decoder. The first one upsamples, the
+        others are residual blocks.
+    :param decoder_type: 'joint' or 'conditioned'
+    :param glyph_embedding_dim: size of the character embedding of the conditioned decoder
+    :param style_classes: number of font styles. If given, a linear layer on the latent vector predicts the
+        style of the font, see `predict_style`.
     """
+
+    _UPSAMPLINGS = 4
 
     def __init__(
             self,
-            kernel_size: int = 3,
-            base_conv_filters: int = 16,
-            batch_norm: bool = False,
-            latent_dim: int = 128,
+            base_channels: int = 8,
+            latent_dim: int = 32,
+            encoder_stages: int = 4,
             decoder_output_channels: int = 42,
             input_dims: Tuple[int, int] = (32, 128),
             output_dims: Tuple[int, int] = (32, 32),
+            decoder_channels: Optional[int] = None,
+            decoder_blocks: int = 1,
+            decoder_type: str = 'joint',
+            glyph_embedding_dim: int = 16,
+            style_classes: int = 0,
     ):
         super().__init__()
+        if decoder_type not in ('joint', 'conditioned'):
+            raise ValueError(f"Unknown decoder_type '{decoder_type}'. Valid options are 'joint' and 'conditioned'.")
+        if decoder_blocks < 1:
+            raise ValueError("decoder_blocks has to be at least 1.")
+        self.decoder_type = decoder_type
         self.latent_dim = latent_dim
         self.input_dims = tuple(input_dims)
         self.output_dims = tuple(output_dims)
         self.output_channels = decoder_output_channels
 
-        def filters(i):
-            return base_conv_filters * 2 ** i
+        if min(self.input_dims) < 2 ** encoder_stages:
+            raise ValueError(f"input_dims {self.input_dims} are too small for {encoder_stages} encoder stages.")
+        scale = 2 ** self._UPSAMPLINGS
+        if any(size < scale or size % scale for size in self.output_dims):
+            raise ValueError(f"output_dims {self.output_dims} have to be multiples of {scale}.")
 
         # encoder
-        height, width = self.input_dims
-        self.encoder = nn.Sequential()
-        for i in range(_ENCODER_LAYERS):
-            layer = OrderedDict()
-            layer['conv2d'] = nn.Conv2d(
-                in_channels=1 if i == 0 else filters(i - 1),
-                out_channels=filters(i),
-                kernel_size=kernel_size,
-                stride=2,
-                padding=1,
-                bias=not batch_norm,
-            )
-            if batch_norm:
-                layer['batch_norm'] = nn.BatchNorm2d(filters(i))
-            layer['leaky_relu'] = nn.LeakyReLU(0.2, inplace=True)
+        channels = [base_channels * 2 ** i for i in range(encoder_stages)]
+        stages = [
+            nn.Conv2d(1, channels[0], kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(channels[0]),
+            nn.LeakyReLU(0.2, inplace=True),
+        ]
+        in_channels = channels[0]
+        for out_channels in channels:
+            stages.append(ResidualBlock(in_channels, out_channels, stride=2))
+            in_channels = out_channels
+        self.encoder = nn.Sequential(*stages)
+        self.to_latent = nn.Linear(channels[-1], latent_dim)
+        self.style_head = nn.Linear(latent_dim, style_classes) if style_classes else None
 
-            self.encoder.add_module(f'conv_layer_{i}', nn.Sequential(layer))
-            height, width = _conv_out(height, kernel_size), _conv_out(width, kernel_size)
-
-        if height < 1 or width < 1:
-            raise ValueError(f"input_dims {self.input_dims} are too small for kernel size {kernel_size}.")
-        encoder_channels = filters(_ENCODER_LAYERS - 1)
-        self.encoder.add_module('flatten', nn.Flatten())
-        self.encoder.add_module('fc', nn.Linear(encoder_channels * height * width, latent_dim))
-
-        # decoder, starts from a feature map that the transposed convolutions grow to output_dims
-        scale = 2 ** _DECODER_LAYERS
+        # decoder
+        width = base_channels if decoder_channels is None else decoder_channels
+        widths = [width * 8, width * 4, width * 2, width * 2, width * 2]
         seed_dims = (self.output_dims[0] // scale, self.output_dims[1] // scale)
-        grown_dims = tuple(_grow(n, kernel_size, _DECODER_LAYERS) for n in seed_dims)
-        if min(seed_dims) < 1 or grown_dims != self.output_dims:
-            raise ValueError(
-                f"The decoder can not produce output_dims {self.output_dims} with kernel size {kernel_size}. "
-                f"Use kernel size 3 and dimensions that are multiples of {scale}."
-            )
 
-        self.decoder = nn.Sequential()
-        self.decoder.add_module('fc', nn.Linear(latent_dim, encoder_channels * seed_dims[0] * seed_dims[1]))
-        self.decoder.add_module('unflatten', nn.Unflatten(1, (encoder_channels, *seed_dims)))
-        for i in range(_DECODER_LAYERS - 1):
-            in_filters = filters(_ENCODER_LAYERS - 1 - i)
-            out_filters = filters(_ENCODER_LAYERS - 2 - i)
-            layer = OrderedDict()
-            layer['conv_transposed_2d'] = nn.ConvTranspose2d(
-                in_channels=in_filters,
-                out_channels=out_filters,
-                kernel_size=kernel_size,
-                stride=2,
-                padding=1,
-                output_padding=1,
-                bias=not batch_norm,
-            )
-            if batch_norm:
-                layer['batch_norm'] = nn.BatchNorm2d(out_filters)
-            layer['leaky_relu'] = nn.LeakyReLU(0.2, inplace=True)
-
-            self.decoder.add_module(f't_conv_layer_{i}', nn.Sequential(layer))
-        self.decoder.add_module('conv_transposed_2d', nn.ConvTranspose2d(
-            in_channels=filters(_ENCODER_LAYERS - _DECODER_LAYERS),
-            out_channels=decoder_output_channels,
-            kernel_size=kernel_size,
-            stride=2,
-            padding=1,
-            output_padding=1,
-        ))
-        self.decoder.add_module('tanh', nn.Tanh())
+        conditioned = decoder_type == 'conditioned'
+        if conditioned:
+            self.glyph_embedding = nn.Embedding(decoder_output_channels, glyph_embedding_dim)
+        self.from_latent = nn.Sequential(
+            nn.Linear(latent_dim + (glyph_embedding_dim if conditioned else 0),
+                      widths[0] * seed_dims[0] * seed_dims[1]),
+            nn.Unflatten(1, (widths[0], *seed_dims)),
+            nn.LeakyReLU(0.2, inplace=True),
+        )
+        layers = []
+        for i in range(self._UPSAMPLINGS):
+            layers.append(UpsampleBlock(widths[i], widths[i + 1]))
+            layers.extend(ResidualBlock(widths[i + 1], widths[i + 1]) for _ in range(decoder_blocks - 1))
+        self.decoder = nn.Sequential(
+            *layers,
+            nn.Conv2d(widths[-1], 1 if conditioned else decoder_output_channels, kernel_size=3, padding=1),
+            nn.Tanh(),
+        )
 
     def encode(self, x):
-        return self.encoder(x)
+        features = self.encoder(x)
+        return self.to_latent(features.mean(dim=(2, 3)))
+
+    def predict_style(self, latent):
+        """
+        :return: tensor (batch, style_classes) of scores, the highest one is the predicted style
+        """
+        if self.style_head is None:
+            raise ValueError("The model has no style head, build it with style_classes.")
+        return self.style_head(latent)
 
     def decode(self, latent):
-        return self.decoder(latent)
+        if self.decoder_type == 'joint':
+            return self.decoder(self.from_latent(latent))
 
-    def forward(self, x):
-        return self.decode(self.encode(x))
-
-
-# name of the architecture in configs and checkpoints written before the rename
-AE2 = AutoEncoder
-
-
-def _conv_out(size, kernel_size, stride=2, padding=1):
-    return (size + 2 * padding - kernel_size) // stride + 1
+        # one pass per glyph: every latent vector is paired with every character embedding
+        batch_size, glyphs = latent.shape[0], self.output_channels
+        styles = latent.unsqueeze(1).expand(batch_size, glyphs, -1)
+        characters = self.glyph_embedding.weight.unsqueeze(0).expand(batch_size, glyphs, -1)
+        conditions = torch.cat([styles, characters], dim=2).reshape(batch_size * glyphs, -1)
+        images = self.decoder(self.from_latent(conditions))
+        return images.reshape(batch_size, glyphs, *self.output_dims)
 
 
-def _grow(size, kernel_size, layers, stride=2, padding=1, output_padding=1):
-    for _ in range(layers):
-        size = (size - 1) * stride - 2 * padding + kernel_size + output_padding
-    return size
+class GlyphDiscriminator(nn.Module):
+    """
+    Judges whether a font fingerprint is real or drawn by the decoder, patch by patch.
+
+    It looks at the glyphs of a fingerprint together, one input channel per glyph as in MC-GAN (Azadi et al.,
+    2018), and outputs a grid of scores. Each score judges a patch of the fingerprint, which pushes the decoder
+    towards sharp, plausible strokes everywhere instead of the blurry average that a pixel loss settles for.
+
+    :param in_channels: number of glyphs in the fingerprint
+    :param base_channels: channels of the first convolution
+    """
+
+    def __init__(self, in_channels: int = 42, base_channels: int = 32):
+        super().__init__()
+
+        def conv(cin, cout, stride):
+            # spectral normalization keeps the discriminator from overpowering the decoder
+            return nn.utils.spectral_norm(nn.Conv2d(cin, cout, kernel_size=4, stride=stride, padding=1))
+
+        self.layers = nn.Sequential(
+            conv(in_channels, base_channels, 2),
+            nn.LeakyReLU(0.2, inplace=True),
+            conv(base_channels, base_channels * 2, 2),
+            nn.LeakyReLU(0.2, inplace=True),
+            conv(base_channels * 2, base_channels * 4, 1),
+            nn.LeakyReLU(0.2, inplace=True),
+            conv(base_channels * 4, 1, 1),
+        )
+
+    def forward(self, fingerprint):
+        return self.layers(fingerprint)

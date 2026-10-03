@@ -1,3 +1,3 @@
-from .model import AE2, AutoEncoder, BaseModel
+from .model import BaseModel, CompactAutoEncoder, GlyphDiscriminator
 
-__all__ = ['AE2', 'AutoEncoder', 'BaseModel']
+__all__ = ['BaseModel', 'CompactAutoEncoder', 'GlyphDiscriminator']

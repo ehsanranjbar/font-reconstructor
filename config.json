@@ -1,23 +1,32 @@
 {
-    "name": "AE2_256",
+    "name": "compact_supcon",
     "seed": 42,
     "n_gpu": 1,
     "device": "auto",
     "arch": {
-        "type": "AutoEncoder",
+        "type": "CompactAutoEncoder",
         "args": {
-            "latent_dim": 256,
-            "batch_norm": false
+            "base_channels": 8,
+            "latent_dim": 32,
+            "decoder_type": "joint",
+            "decoder_channels": 8,
+            "decoder_blocks": 1
         }
     },
     "dataset": {
         "fonts_dir": "data/fonts",
         "annotation_file": "data/fonts.csv",
-        "font_size": 32,
+        "font_size": 64,
+        "layout_engine": "raqm",
+        "corpus_files": [
+            "data/corpus/shahnameh.txt",
+            "data/corpus/words.txt"
+        ],
         "text_length": [
             3,
             8
         ],
+        "number_ratio": 0.1,
         "text_image_dims": [
             128,
             32
@@ -26,6 +35,7 @@
             32,
             32
         ],
+        "render_scale": 2,
         "cache_dir": "data/cache"
     },
     "data_loader": {
@@ -33,9 +43,11 @@
             "random_seed": 42,
             "total_samples": 1000000,
             "random_augmentations": true,
+            "validation_augmentations": true,
             "validation_split": 0.1,
+            "batch_fonts": 32,
+            "batch_samples_per_font": 4,
             "batch_size": 128,
-            "shuffle": true,
             "num_workers": 12,
             "pin_memory": true
         }
@@ -44,6 +56,7 @@
         "args": {
             "random_seed": 123,
             "samples_per_font": 100,
+            "random_augmentations": true,
             "batch_size": 128,
             "num_workers": 12,
             "pin_memory": true
@@ -52,17 +65,31 @@
     "optimizer": {
         "type": "Adam",
         "args": {
-            "lr": 0.001,
+            "lr": 0.005,
             "weight_decay": 0,
             "amsgrad": true
         }
     },
-    "loss": "mse_loss",
+    "loss": "l1_loss",
+    "contrastive_loss": {
+        "weight": 0.5,
+        "temperature": 0.1
+    },
+    "style_head": {
+        "weight": 0.2,
+        "detach": false
+    },
+    "adversarial_loss": {
+        "weight": 0.0,
+        "start_epoch": 5,
+        "lr": 0.0002,
+        "discriminator_channels": 32
+    },
     "metrics": [],
     "lr_scheduler": {
         "type": "StepLR",
         "args": {
-            "step_size": 50,
+            "step_size": 10,
             "gamma": 0.1
         }
     },
@@ -72,12 +99,13 @@
         "save_period": 1,
         "keep_last_checkpoints": 5,
         "verbosity": 2,
-        "monitor": "min val_loss",
+        "monitor": "max val_top1_acc",
         "early_stop": 10,
         "topk": [
-            5,
-            10
+            1,
+            5
         ],
-        "tensorboard": true
+        "tensorboard": true,
+        "figure_period": 1
     }
 }
