@@ -632,3 +632,53 @@ def plot_latent_comparison(latent: np.ndarray, groups: Sequence[int], fonts: Seq
     _scale_legend(figure, _rect(figure, left, bottom + map_height - matrix_size - 0.55, min(3.2, matrix_size), 0.12),
                   DIVERGING, -1, 1, ['-1 opposite', '0 unrelated', '1 same direction'])
     return figure
+
+
+def plot_lr_range_test(rates: np.ndarray, losses: dict, smoothed: np.ndarray, marks: dict) -> Figure:
+    """
+    The losses of a learning rate range test: a short training run whose learning rate rises exponentially.
+
+    The usable learning rates are those where the loss falls. Past the lowest point the steps are too large.
+
+    :param rates: the learning rate of each step
+    :param losses: dict of name to array, the losses of each step. `total_loss` is the one that was optimized.
+    :param smoothed: the total loss after smoothing, which the marks are read from
+    :param marks: dict of label to learning rate, drawn as vertical lines
+    """
+    parts = [name for name in losses if name != 'total_loss']
+    figure = _figure(9.6, 5.3 + 1.75 * int(np.ceil(len(parts) / 3)), 'Learning rate range test',
+                     'The loss of every step while the learning rate rises. Usable rates are where the smoothed '
+                     'loss falls.')
+    total_height = figure.get_size_inches()[1]
+
+    ax = _axes(figure, _rect(figure, 0.8, total_height - 4.25, 8.3, 3.0))
+    ax.plot(rates, losses['total_loss'], color=AXIS, linewidth=1, label='each step')
+    ax.plot(rates[:len(smoothed)], smoothed, color=SERIES_1, linewidth=2, solid_capstyle='round',
+            label='smoothed')
+    low, high = float(np.nanmin(smoothed)), float(np.nanmax(smoothed[:max(len(smoothed) // 2, 1)]))
+    ax.set_ylim(low - 0.08 * (high - low), high + 0.25 * (high - low))
+    for position, (label, rate) in enumerate(marks.items()):
+        ax.axvline(rate, color=INK_MUTED, linewidth=1)
+        ax.annotate(f"{label}  {rate:.2g}", (rate, 1.0), xycoords=('data', 'axes fraction'),
+                    xytext=(5, -12 - 14 * position), textcoords='offset points', color=INK, fontsize=9)
+    ax.set_xscale('log')
+    ax.set_ylabel('total loss')
+    legend = ax.legend(loc='lower left', frameon=False, fontsize=9)
+    for text in legend.get_texts():
+        text.set_color(INK_SECONDARY)
+
+    # each term of the loss on its own scale
+    for index, name in enumerate(parts):
+        row, column = divmod(index, 3)
+        ax = _axes(figure, _rect(figure, 0.8 + column * 2.9, total_height - 6.35 - row * 1.75, 2.5, 1.15))
+        values = np.asarray(losses[name], dtype=np.float64)
+        ax.plot(rates[:len(values)], values, color=SERIES_1, linewidth=1.5)
+        finite = values[np.isfinite(values)]
+        if len(finite):
+            ax.set_ylim(finite.min(), np.percentile(finite, 97))
+        ax.set_xscale('log')
+        ax.set_title(name.replace('_', ' '), loc='left', fontsize=9, color=INK_SECONDARY, pad=5)
+        ax.tick_params(labelsize=8)
+        if row == int(np.ceil(len(parts) / 3)) - 1:
+            ax.set_xlabel('learning rate')
+    return figure

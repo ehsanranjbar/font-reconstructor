@@ -61,9 +61,9 @@ def corpus_file(tmp_path_factory):
 
 def load_script(name):
     """
-    import one of the scripts at the repository root as a module
+    import a script of the repository as a module, for example 'train' or 'scripts/find_lr'
     """
-    spec = importlib.util.spec_from_file_location(f'{name}_script', REPO_ROOT / f'{name}.py')
+    spec = importlib.util.spec_from_file_location(f"{Path(name).name}_script", REPO_ROOT / f'{name}.py')
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

@@ -123,7 +123,8 @@ that history (`CaptureSimulation` in `font_reconstructor/dataset/capture.py`):
 2. ink spread or loss, lens blur and camera motion
 3. a dark-on-light photo with uneven lighting, sensor noise, limited resolution and JPEG compression
 4. the cleanup: background removal, contrast stretch, and for half of the images a threshold
-5. a crop to the text with a random margin, which can cut into the text, and resizing to the model input
+5. a crop to the text with a random margin and resizing to the model input. The crop never cuts into the
+   text by default, because the dots and tails of letters at the edge tell fonts apart.
 
 Steps 2 and 4 make strokes thicker or thinner, which is what a real threshold does. Texts are rendered
 at `render_scale` times the model input, so these changes are finer than one pixel of the input.
@@ -155,6 +156,29 @@ run with `tensorboard --logdir saved/log`.
 The first run renders all text images and font fingerprints into `data/cache/`. Later runs with
 the same settings map these files into memory, so they start fast and data loader workers share
 one copy.
+
+### Learning rate
+
+The `lr_scheduler` block takes any class of `torch.optim.lr_scheduler`. Its `interval` says when the
+scheduler is stepped: after every `"epoch"`, or after every `"batch"`. An epoch has thousands of batches,
+so schedules with a warmup need `"batch"`.
+
+The default is `OneCycleLR`: the rate rises from `max_lr / div_factor` to `max_lr` during the first
+`pct_start` of all steps, then falls along a cosine to almost zero. The length of the schedule is the
+`epochs` of the trainer, so `epochs` is a budget here: lower it to finish sooner, and expect the run to
+use all of it unless early stopping ends it. The `lr` of the optimizer and the `--lr` option have no
+effect with this scheduler, `max_lr` sets the rate. The position in the schedule is stored in
+checkpoints, so a resumed run continues where it stopped.
+
+To find `max_lr` for a config, run a range test. It trains for a few hundred steps while the rate rises
+and writes a plot of the loss against the rate:
+
+```bash
+python scripts/find_lr.py -c config.json
+```
+
+Pick the rate where the loss stops falling, a few times below the rate where it starts to rise. Run the
+test again after changing the batch size or the loss weights, they move the usable rates.
 
 ### What is trained and how it is measured
 
@@ -281,6 +305,7 @@ train.py, test.py           command line entry points
 config.json                 default configuration
 scripts/download_corpus.py  downloads the text corpus
 scripts/dedupe_fonts.py     finds and removes fonts that draw the same glyphs
+scripts/find_lr.py          learning rate range test
 font_reconstructor/
   config.py                 ConfigParser: config file, command line overrides, run directories
   factory.py                builds fonts, corpus, loaders, model and losses from the config

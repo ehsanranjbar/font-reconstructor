@@ -44,10 +44,10 @@ def main(config):
     contrastive_criterion, contrastive_weight = factory.build_contrastive(config)
     metrics = factory.build_metrics(config)
 
-    # build optimizer, learning rate scheduler. delete every lines containing lr_scheduler for disabling scheduler
+    # build optimizer and learning rate scheduler. Remove the lr_scheduler block of the config to train without one.
     trainable_params = filter(lambda p: p.requires_grad, model.parameters())
     optimizer = config.init_obj('optimizer', torch.optim, trainable_params)
-    lr_scheduler = config.init_obj('lr_scheduler', torch.optim.lr_scheduler, optimizer)
+    lr_scheduler, lr_scheduler_interval = factory.build_lr_scheduler(config, optimizer, len(data_loader))
 
     trainer = Trainer(model, criterion, metrics, optimizer,
                       config=config,
@@ -57,6 +57,7 @@ def main(config):
                       clustering_data_loader=clustering_data_loader,
                       num_fonts=len(fonts),
                       lr_scheduler=lr_scheduler,
+                      lr_scheduler_interval=lr_scheduler_interval,
                       contrastive_criterion=contrastive_criterion,
                       contrastive_weight=contrastive_weight,
                       **factory.build_adversarial(config, fonts, device),

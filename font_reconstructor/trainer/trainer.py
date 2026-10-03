@@ -23,6 +23,8 @@ class Trainer(BaseTrainer):
         validation. Without it validation reports no top-k accuracy.
     :param num_fonts: number of fonts, needed together with clustering_data_loader
     :param len_epoch: number of batches of an epoch for iteration-based training. One pass over data_loader if None.
+    :param lr_scheduler_interval: 'epoch' to step the learning rate scheduler after every epoch, 'batch' to step
+        it after every batch, which schedules with a warmup need. The scheduler is stored in checkpoints.
     :param contrastive_criterion: optional loss function of (latent, font_index) that shapes the latent space
         for font retrieval. It is added to the reconstruction loss, scaled by `contrastive_weight`.
 
@@ -44,7 +46,8 @@ class Trainer(BaseTrainer):
 
     def __init__(self, model, criterion, metric_ftns, optimizer, config, device,
                  data_loader, valid_data_loader=None, clustering_data_loader=None, num_fonts=None,
-                 lr_scheduler=None, len_epoch=None, contrastive_criterion=None, contrastive_weight=1.0,
+                 lr_scheduler=None, lr_scheduler_interval='epoch', len_epoch=None,
+                 contrastive_criterion=None, contrastive_weight=1.0,
                  discriminator=None, discriminator_optimizer=None, adversarial_weight=0.0,
                  adversarial_start_epoch=1, style_weight=0.0, style_detach=False):
         super().__init__(model, criterion, metric_ftns, optimizer, config)
@@ -86,6 +89,12 @@ class Trainer(BaseTrainer):
             raise ValueError("num_fonts is required when a clustering data loader is given.")
         self.topk = tuple(config['trainer'].get('topk', (5, 10))) if self.do_topk else ()
         self.lr_scheduler = lr_scheduler
+        if lr_scheduler_interval not in ('epoch', 'batch'):
+            raise ValueError(f"Unknown lr_scheduler_interval '{lr_scheduler_interval}', use 'epoch' or 'batch'.")
+        self.lr_scheduler_interval = lr_scheduler_interval
+        if self.lr_scheduler is not None and 'lr_scheduler' in self._extras_to_load:
+            # a resumed run continues its schedule instead of starting it again
+            self.lr_scheduler.load_state_dict(self._extras_to_load['lr_scheduler'])
 
         # the fixed panel of samples and the baseline that every validation is compared on
         self.figure_period = max(1, int(config['trainer'].get('figure_period', 1)))
@@ -105,12 +114,43 @@ class Trainer(BaseTrainer):
         self.train_metrics = MetricTracker('loss', *extra_keys, *[m.__name__ for m in self.metric_ftns])
 
     def _checkpoint_extras(self):
-        if self.discriminator is None:
-            return {}
-        return {
-            'discriminator': self.discriminator.state_dict(),
-            'discriminator_optimizer': self.discriminator_optimizer.state_dict(),
-        }
+        extras = {}
+        if self.lr_scheduler is not None:
+            extras['lr_scheduler'] = self.lr_scheduler.state_dict()
+        if self.discriminator is not None:
+            extras['discriminator'] = self.discriminator.state_dict()
+            extras['discriminator_optimizer'] = self.discriminator_optimizer.state_dict()
+        return extras
+
+    def compute_losses(self, batch, adversarial=False):
+        """
+        The losses of one training batch. With `adversarial` the discriminator is trained one step on the way.
+
+        :param batch: a sample dict of the training loader
+        :return: (losses, output, target). losses is a dict of tensors: `loss` is the reconstruction loss,
+                 `total_loss` the weighted sum that is optimized, and the other terms are there if they are
+                 configured. `style_acc` is a float.
+        """
+        data, target = batch['image'].to(self.device), batch['target'].to(self.device)
+        output, latent = self.model(data, return_latent=True)
+
+        losses = {'loss': self.criterion(output, target)}
+        total_loss = losses['loss']
+        if self.contrastive_criterion is not None:
+            losses['contrastive_loss'] = self.contrastive_criterion(latent, batch['font_index'].to(self.device))
+            total_loss = total_loss + self.contrastive_weight * losses['contrastive_loss']
+        if self.style_weight:
+            style_index = batch['style_index'].to(self.device)
+            logits = self.core_model.predict_style(latent.detach() if self.style_detach else latent)
+            losses['style_loss'] = F.cross_entropy(logits, style_index)
+            losses['style_acc'] = style_accuracy(logits, style_index)
+            total_loss = total_loss + self.style_weight * losses['style_loss']
+        if adversarial:
+            losses['discriminator_loss'] = self._train_discriminator(output.detach(), target)
+            losses['adversarial_loss'] = adversarial_loss(self.discriminator(output))
+            total_loss = total_loss + self.adversarial_weight * losses['adversarial_loss']
+        losses['total_loss'] = total_loss
+        return losses, output, target
 
     def _train_epoch(self, epoch):
         """
@@ -127,40 +167,20 @@ class Trainer(BaseTrainer):
         batches = self.data_loader if self._batches is None else self._batches
         train_loop = tqdm(batches, total=self.len_epoch, desc=f'Epoch [{epoch}]')
         for batch_idx, batch in enumerate(train_loop):
-            data, target = batch['image'], batch['target']
-
             # write the model graph at first batch of epoch 1
             if epoch == 1 and batch_idx == 0 and self.writer.enabled:
-                self.writer.add_graph(move_model_to_cpu(self.model), input_to_model=data, verbose=False)
-
-            data, target = data.to(self.device), target.to(self.device)
+                self.writer.add_graph(move_model_to_cpu(self.model), input_to_model=batch['image'], verbose=False)
 
             self.optimizer.zero_grad()
-            output, latent = self.model(data, return_latent=True)
-            loss = self.criterion(output, target)
-            total_loss = loss
-            if self.contrastive_criterion is not None:
-                contrastive_loss = self.contrastive_criterion(latent, batch['font_index'].to(self.device))
-                total_loss = total_loss + self.contrastive_weight * contrastive_loss
-                self.train_metrics.update('contrastive_loss', contrastive_loss.item())
-            if self.style_weight:
-                style_index = batch['style_index'].to(self.device)
-                logits = self.core_model.predict_style(latent.detach() if self.style_detach else latent)
-                style_loss = F.cross_entropy(logits, style_index)
-                total_loss = total_loss + self.style_weight * style_loss
-                self.train_metrics.update('style_loss', style_loss.item())
-                self.train_metrics.update('style_acc', style_accuracy(logits, style_index))
-            if adversarial:
-                self.train_metrics.update('discriminator_loss', self._train_discriminator(output.detach(), target))
-                generator_loss = adversarial_loss(self.discriminator(output))
-                total_loss = total_loss + self.adversarial_weight * generator_loss
-                self.train_metrics.update('adversarial_loss', generator_loss.item())
-            if total_loss is not loss:
-                self.train_metrics.update('total_loss', total_loss.item())
-            total_loss.backward()
+            losses, output, target = self.compute_losses(batch, adversarial)
+            losses['total_loss'].backward()
             self.optimizer.step()
+            if self.lr_scheduler is not None and self.lr_scheduler_interval == 'batch':
+                self.lr_scheduler.step()
 
-            self.train_metrics.update('loss', loss.item())
+            for name in self.train_metrics.keys:
+                if name in losses:
+                    self.train_metrics.update(name, float(losses[name]))
             for met in self.metric_ftns:
                 self.train_metrics.update(met.__name__, met(output, target))
 
@@ -177,7 +197,7 @@ class Trainer(BaseTrainer):
             val_log = self._valid_epoch(epoch)
             log.update(**{'val_' + k: v for k, v in val_log.items()})
 
-        if self.lr_scheduler is not None:
+        if self.lr_scheduler is not None and self.lr_scheduler_interval == 'epoch':
             if isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                 # without a validation set the plateau is judged on the training loss
                 self.lr_scheduler.step(log.get('val_loss', log['loss']))

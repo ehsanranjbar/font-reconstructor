@@ -121,7 +121,7 @@ def test_train_with_conditioned_decoder_and_adversarial_loss(fonts_dir, tmp_path
     checkpoint_path = run_dir(tmp_path, 'adversarial') / 'checkpoint-epoch2.pth'
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
     # the discriminator is stored with the checkpoint, so that a resumed run continues the same game
-    assert set(checkpoint['extras']) == {'discriminator', 'discriminator_optimizer'}
+    assert set(checkpoint['extras']) == {'discriminator', 'discriminator_optimizer', 'lr_scheduler'}
 
     resumed = copy.deepcopy(config)
     resumed['trainer']['epochs'] = 3
@@ -157,6 +157,77 @@ def test_train_with_style_head(fonts_dir, tmp_path):
     # the head can also be trained as a probe that leaves the encoder alone
     config['style_head'] = {'weight': 1.0, 'detach': True}
     train.main(ConfigParser(copy.deepcopy(config), run_id='style_probe'))
+
+
+def test_one_cycle_schedule_is_stepped_every_batch_and_resumed(fonts_dir, tmp_path):
+    train = load_script('train')
+    config = make_config(fonts_dir, tmp_path, epochs=4)
+    config['lr_scheduler'] = {'type': 'OneCycleLR', 'args': {'max_lr': 0.01, 'pct_start': 0.25, 'div_factor': 10}}
+    steps_per_epoch = 4  # 32 training samples in batches of 8
+
+    # stop after two of the four epochs, as an interrupted run would
+    first = copy.deepcopy(config)
+    first['trainer']['early_stop'] = 1
+    first['trainer']['monitor'] = 'min epoch'
+    train.main(ConfigParser(first, run_id='one_cycle'))
+    checkpoint_path = sorted(run_dir(tmp_path, 'one_cycle').glob('checkpoint-*.pth'))[-1]
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
+    scheduler = checkpoint['extras']['lr_scheduler']
+    # the schedule spans all epochs of the run, and has been stepped once per batch
+    assert scheduler['total_steps'] == 4 * steps_per_epoch
+    assert scheduler['last_epoch'] == checkpoint['epoch'] * steps_per_epoch
+    assert checkpoint['epoch'] < 4
+
+    # a resumed run continues the schedule to its end instead of starting it again
+    train.main(ConfigParser(copy.deepcopy(config), resume=checkpoint_path, run_id='one_cycle_resumed'))
+    final = torch.load(run_dir(tmp_path, 'one_cycle_resumed') / 'checkpoint-epoch4.pth', map_location='cpu',
+                       weights_only=True)
+    assert final['extras']['lr_scheduler']['last_epoch'] == 4 * steps_per_epoch
+    assert final['optimizer']['param_groups'][0]['lr'] < 0.01 / 10
+
+
+def test_lr_scheduler_intervals(fonts_dir, tmp_path):
+    from font_reconstructor import factory
+
+    optimizer = torch.optim.Adam([torch.nn.Parameter(torch.zeros(1))], lr=0.1)
+    config = make_config(fonts_dir, tmp_path, epochs=5)
+
+    # the template default: stepped once per epoch
+    scheduler, interval = factory.build_lr_scheduler(config, optimizer, steps_per_epoch=7)
+    assert isinstance(scheduler, torch.optim.lr_scheduler.StepLR) and interval == 'epoch'
+
+    # the length of a schedule comes from the run where the config leaves it out
+    config['lr_scheduler'] = {'type': 'OneCycleLR', 'args': {'max_lr': 0.1}}
+    scheduler, interval = factory.build_lr_scheduler(config, optimizer, steps_per_epoch=7)
+    assert interval == 'batch' and scheduler.total_steps == 5 * 7
+    config['lr_scheduler'] = {'type': 'CosineAnnealingLR', 'interval': 'batch', 'args': {}}
+    scheduler, interval = factory.build_lr_scheduler(config, optimizer, steps_per_epoch=7)
+    assert interval == 'batch' and scheduler.T_max == 5 * 7
+    config['lr_scheduler'] = {'type': 'CosineAnnealingLR', 'args': {}}
+    assert factory.build_lr_scheduler(config, optimizer, steps_per_epoch=7)[0].T_max == 5
+
+    with pytest.raises(ValueError):
+        config['lr_scheduler'] = {'type': 'OneCycleLR', 'interval': 'epoch', 'args': {'max_lr': 0.1}}
+        factory.build_lr_scheduler(config, optimizer, steps_per_epoch=7)
+    del config['lr_scheduler']
+    assert factory.build_lr_scheduler(config, optimizer, steps_per_epoch=7) == (None, 'epoch')
+
+
+def test_lr_range_test_readings():
+    import numpy as np
+    find_lr = load_script('scripts/find_lr')
+
+    # the moving average is corrected for its start, so a constant stays a constant
+    assert np.allclose(find_lr.smooth([2.0] * 5), 2.0)
+    assert find_lr.smooth([0.0, 10.0])[-1] == pytest.approx((0.9 * 0.0 + 0.1 * 10.0 + 0.0) / (1 - 0.9 ** 2))
+
+    # a loss that falls fastest at 1e-3, is lowest at 1e-2 and rises after it
+    rates = np.logspace(-5, 0, 101)
+    log_rate = np.log10(rates)
+    loss = np.where(log_rate < -2, 1 - 1 / (1 + np.exp(-4 * (log_rate + 3))), (log_rate + 2) ** 2 * 0.5 + 0.018)
+    marks = find_lr.read_marks(rates, loss)
+    assert marks['steepest'] == pytest.approx(1e-3, rel=0.3)
+    assert marks['minimum'] == pytest.approx(1e-2, rel=0.3)
 
 
 def test_train_without_validation(fonts_dir, tmp_path):

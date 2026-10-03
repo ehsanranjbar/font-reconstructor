@@ -164,6 +164,46 @@ def build_contrastive(config):
     return criterion, weight
 
 
+# schedulers that plan every step in advance, so they are stepped after every batch
+_BATCH_SCHEDULERS = ('OneCycleLR', 'CyclicLR')
+
+
+def build_lr_scheduler(config, optimizer, steps_per_epoch):
+    """
+    The learning rate scheduler of the `lr_scheduler` block, any class of torch.optim.lr_scheduler.
+
+    `interval` says when it is stepped: after every 'epoch', or after every 'batch'. Schedules with a warmup
+    need 'batch', and it is the default for OneCycleLR and CyclicLR. The length of the schedule is filled in
+    from the run where it is not given: `epochs` and `steps_per_epoch` of OneCycleLR, and `T_max` of
+    CosineAnnealingLR.
+
+    :param steps_per_epoch: number of training batches of an epoch
+    :return: (scheduler, interval), or (None, 'epoch') if the config has no scheduler
+    """
+    cfg = config.get('lr_scheduler')
+    if not cfg:
+        return None, 'epoch'
+
+    name = cfg['type']
+    interval = cfg.get('interval', 'batch' if name in _BATCH_SCHEDULERS else 'epoch')
+    if interval not in ('epoch', 'batch'):
+        raise ValueError(f"Unknown lr_scheduler interval '{interval}', use 'epoch' or 'batch'.")
+
+    args = dict(cfg.get('args', {}))
+    epochs = config['trainer']['epochs']
+    if name == 'OneCycleLR':
+        if interval != 'batch':
+            raise ValueError("OneCycleLR plans every training step, its interval has to be 'batch'.")
+        if 'total_steps' not in args:
+            args.setdefault('epochs', epochs)
+            args.setdefault('steps_per_epoch', steps_per_epoch)
+    elif name == 'CosineAnnealingLR':
+        args.setdefault('T_max', epochs * steps_per_epoch if interval == 'batch' else epochs)
+
+    scheduler = getattr(torch.optim.lr_scheduler, name)(optimizer, **args)
+    return scheduler, interval
+
+
 def build_style_head(config):
     """
     The style head, configured by the `style_head` block.

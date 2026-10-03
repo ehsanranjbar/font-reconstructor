@@ -332,6 +332,11 @@ def test_figures_render():
     draw(figures.plot_latent_comparison(
         rng.normal(size=(6, 16)), [0, 0, 0, 1, 1, 1], ['A Font'] * 3 + ['Other'] * 3, ['متن', '۱۲', 'abc'] * 2,
         mean=np.zeros(16), spread=np.ones(16), font_signal=rng.uniform(0, 1, 16)))
+    rates = np.logspace(-5, 0, 50)
+    losses = {'total_loss': np.linspace(3, 2, 50), 'loss': np.linspace(1, 0.5, 50),
+              'contrastive_loss': np.linspace(4, 3, 50), 'style_loss': np.linspace(2, 1, 50)}
+    draw(figures.plot_lr_range_test(rates, losses, losses['total_loss'], {'steepest': 1e-3, 'minimum': 1e-2}))
+    draw(figures.plot_lr_range_test(rates, {'total_loss': losses['total_loss']}, losses['total_loss'][:40], {}))
     # a single font has no other font to be compared with
     draw(figures.plot_latent_comparison(
         rng.normal(size=(2, 4)), [0, 0], ['A Font'] * 2, ['a', 'b'], np.zeros(4), np.ones(4), np.ones(4)))

@@ -98,6 +98,10 @@ class MetricTracker:
         self._keys = list(keys)
         self.reset()
 
+    @property
+    def keys(self):
+        return list(self._keys)
+
     def reset(self):
         self._total = {key: 0.0 for key in self._keys}
         self._counts = {key: 0 for key in self._keys}
