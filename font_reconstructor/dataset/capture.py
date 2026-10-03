@@ -10,7 +10,7 @@ dark-on-light "photo" with uneven lighting, sensor noise and compression, and th
 a real pipeline runs: background normalization, optional binarization, cropping to the text and resizing.
 """
 import io
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 import numpy as np
 from PIL import Image, ImageFilter
@@ -104,6 +104,9 @@ class CaptureSimulation:
     :param jpeg_quality: range of the compression quality
     :param margin: range of the margin around the text on each side, as a fraction of the text height. With
         a negative lower end, crops can cut into the text, which loses the dots and tails of letters.
+    :param min_ink, max_ink: a result has to keep between `min_ink` and `max_ink` times the bright area of
+        the clean rendering. Otherwise the text was lost or drowned in noise, and the simulation is run again.
+    :param max_tries: number of runs before the clean rendering is returned instead
     """
 
     def __init__(
@@ -121,6 +124,9 @@ class CaptureSimulation:
         jpeg_prob: float = 0.5,
         jpeg_quality: Tuple[int, int] = (25, 90),
         margin: Tuple[float, float] = (0.0, 0.25),
+        min_ink: float = 0.35,
+        max_ink: float = 3.0,
+        max_tries: int = 3,
     ):
         self.dims = tuple(dims)
         self.binarize_prob = binarize_prob
@@ -135,6 +141,9 @@ class CaptureSimulation:
         self.jpeg_prob = jpeg_prob
         self.jpeg_quality = tuple(jpeg_quality)
         self.margin = tuple(margin)
+        self.min_ink = min_ink
+        self.max_ink = max_ink
+        self.max_tries = max_tries
 
     def __call__(self, image: np.ndarray, rng: np.random.Generator) -> np.ndarray:
         """
@@ -142,15 +151,31 @@ class CaptureSimulation:
         :param rng: the only source of randomness
         :return: uint8 array shaped (height, width) of `dims`, white text on black
         """
-        text = Image.fromarray(image)
-        text = self._distort(text, rng)
-        text = self._print_and_focus(text, rng)
-        photo = self._photograph(text, rng)
-        cleaned = self._clean_up(photo, rng)
+        clean = clean_text_image(image, self.dims)
+        clean_ink = float((clean > 127).mean())
+        for _ in range(self.max_tries):
+            text = Image.fromarray(image)
+            text = self._distort(text, rng)
+            text = self._print_and_focus(text, rng)
+            photo = self._photograph(text, rng)
+            cleaned = self._clean_up(photo, rng)
 
-        margins = tuple(rng.uniform(*self.margin, size=4))
-        align = (rng.uniform(0.0, 1.0), rng.uniform(0.3, 0.7))
-        return np.asarray(fit_to_box(cleaned, self.dims, margins, align))
+            margins = tuple(rng.uniform(*self.margin, size=4))
+            align = (rng.uniform(0.0, 1.0), rng.uniform(0.3, 0.7))
+            result = np.asarray(fit_to_box(cleaned, self.dims, margins, align))
+            if self._shows_text(result, clean_ink):
+                return result
+
+        # every try destroyed the text, as a hard threshold does to hairline strokes. An image without its text
+        # teaches nothing about the font, so the clean rendering stands in.
+        return clean
+
+    def _shows_text(self, result: np.ndarray, clean_ink: float) -> bool:
+        """
+        whether a result still shows its text: its amount of ink is in the range of the clean rendering's
+        """
+        ink = float((result > 127).mean())
+        return self.min_ink * clean_ink <= ink <= max(self.max_ink * clean_ink, 0.05)
 
     def _distort(self, text: Image.Image, rng) -> Image.Image:
         """
@@ -212,19 +237,19 @@ class CaptureSimulation:
         """
         what preprocessing does to a photo: remove the background, invert, stretch the contrast and often binarize
         """
-        # the background is the photo without its dark strokes, estimated at a low resolution
-        small = photo.resize((max(2, photo.width // 4), max(2, photo.height // 4)), Image.BOX)
-        background = small.filter(ImageFilter.MaxFilter(7)).filter(ImageFilter.GaussianBlur(2))
-        background = np.asarray(background.resize(photo.size, Image.BILINEAR), dtype=np.float32)
+        pixels = np.asarray(photo, dtype=np.float32)
+        background = _estimate_background(pixels)
+        ink = (background - pixels) / np.maximum(background, 1.0)
 
-        ink = (background - np.asarray(photo, dtype=np.float32)) / np.maximum(background, 1.0)
-
-        # stretch the contrast from just above the noise of the background to the darkest strokes. The peak is
-        # read from a smoothed image, so that single noisy pixels do not set it.
-        noise_level = 1.4826 * float(np.median(np.abs(ink)))
-        floor = rng.uniform(1.0, 3.0) * noise_level
+        # Stretch the contrast from just above the background to the darkest strokes. The level and the noise of
+        # the background are read from the lower part of the values, which is background even under heavy text.
+        # The peak is read from a smoothed image, so that single noisy pixels do not set it.
+        low, level = _quantiles(ink, (0.05, 0.30))
+        noise_level = max(float(level - low), 0.0) / 1.1
         smoothed = Image.fromarray((np.clip(ink, 0.0, 1.0) * 255).astype(np.uint8)).filter(ImageFilter.BoxBlur(1))
-        peak = max(float(np.asarray(smoothed).max()) / 255.0, floor + 0.05)
+        peak = max(float(np.asarray(smoothed).max()) / 255.0, 0.05)
+        # the floor never reaches up into the strokes, whatever the estimates say
+        floor = min(float(level) + rng.uniform(1.0, 3.0) * noise_level, 0.4 * peak)
         ink = np.clip((ink - floor) / (peak - floor), 0.0, 1.0)
 
         if rng.random() < self.binarize_prob:
@@ -235,6 +260,50 @@ class CaptureSimulation:
             ink = ink ** rng.uniform(0.6, 1.7)
 
         return Image.fromarray((ink * 255).astype(np.uint8))
+
+
+def _quantiles(values: np.ndarray, quantiles: Sequence[float]) -> np.ndarray:
+    """
+    the values at the given quantiles, without interpolation. Much faster than np.percentile on small arrays,
+    which matters for code that runs on every training image.
+    """
+    flat = values.ravel()
+    positions = [min(int(quantile * flat.size), flat.size - 1) for quantile in quantiles]
+    return np.partition(flat, positions)[positions]
+
+
+def _estimate_background(pixels: np.ndarray, tiles: Tuple[int, int] = (2, 8)) -> np.ndarray:
+    """
+    The brightness of the paper at every pixel of a photo of dark text on light paper.
+
+    The paper is taken to be lit evenly or with a gradient, so a plane is fitted to the bright level of the
+    tiles of a coarse grid. Unlike a local maximum, this does not depend on the strokes being thin: the inside
+    of a heavy stroke stays ink instead of becoming "paper", which would leave only its outline.
+
+    :param pixels: float array (height, width) of the photo
+    :param tiles: (rows, columns) of the grid
+    """
+    height, width = pixels.shape
+    rows, columns = min(tiles[0], height), min(tiles[1], width)
+    row_edges = np.linspace(0, height, rows + 1).astype(int)
+    column_edges = np.linspace(0, width, columns + 1).astype(int)
+
+    points, levels = [], []
+    for i in range(rows):
+        for j in range(columns):
+            tile = pixels[row_edges[i]:row_edges[i + 1], column_edges[j]:column_edges[j + 1]]
+            points.append([1.0, (column_edges[j] + column_edges[j + 1]) / 2, (row_edges[i] + row_edges[i + 1]) / 2])
+            levels.append(_quantiles(tile, (0.95,))[0])
+    points, levels = np.array(points), np.array(levels)
+
+    plane = np.linalg.lstsq(points, levels, rcond=None)[0]
+    # a tile that is covered by text is far darker than the plane, the fit is repeated without such tiles
+    paper = levels - points @ plane > -0.1 * levels.max()
+    if 3 <= paper.sum() < len(levels):
+        plane = np.linalg.lstsq(points[paper], levels[paper], rcond=None)[0]
+
+    x, y = np.meshgrid(np.arange(width, dtype=np.float32), np.arange(height, dtype=np.float32))
+    return plane[0] + plane[1] * x + plane[2] * y
 
 
 def _perspective_coefficients(output_points, input_points):

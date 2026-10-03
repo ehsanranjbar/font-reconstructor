@@ -541,3 +541,52 @@ def test_fontset_styles(fonts, fonts_dir, tmp_path):
     assert labelled.styles == ['naskh', 'bold', 'kufi']
     assert labelled.style_names == ['bold', 'kufi', 'naskh']
     assert labelled.style_indices == [2, 0, 1]
+
+
+def test_background_estimate_ignores_heavy_text():
+    from font_reconstructor.dataset.capture import _estimate_background
+
+    # paper that gets brighter to the right, with a block of ink far wider than any stroke
+    x = np.linspace(150, 230, 256, dtype=np.float32)[None, :].repeat(64, axis=0)
+    photo = x.copy()
+    photo[12:52, 60:200] = 30
+    background = _estimate_background(photo)
+    # the paper level is recovered under the ink too, so the ink is not mistaken for paper
+    assert np.abs(background - x).max() < 12
+    assert (background[12:52, 60:200] - photo[12:52, 60:200]).min() > 100
+
+
+def test_cleanup_keeps_heavy_strokes_solid():
+    from PIL import Image
+
+    # a rendering with a stroke 36 pixels thick, as the heaviest fonts have
+    canvas = np.zeros((64, 256), dtype=np.uint8)
+    canvas[14:50, 40:210] = 255
+    for binarize in (0.0, 1.0):
+        simulation = CaptureSimulation((128, 32), binarize_prob=binarize)
+        for seed in range(20):
+            rng = np.random.default_rng(seed)
+            photo = simulation._photograph(Image.fromarray(canvas), rng)
+            cleaned = np.asarray(simulation._clean_up(photo, rng), dtype=np.float32)
+            # the middle of the stroke is ink, not only its edges
+            rows, columns = cleaned.shape
+            middle = cleaned[int(rows * 0.4):int(rows * 0.6), int(columns * 0.3):int(columns * 0.7)]
+            assert np.median(middle) > 150, (binarize, seed)
+            assert np.median(cleaned[:3]) < 60, 'the paper above the stroke stays dark'
+
+
+def test_capture_simulation_never_returns_an_image_without_its_text(fonts):
+    canvas = text_canvas(fonts)
+    clean = clean_text_image(canvas, (128, 32))
+    clean_ink = (clean > 127).mean()
+
+    # an erosion that wipes out the strokes, followed by a hard threshold: most tries lose the text
+    harsh = CaptureSimulation((128, 32), binarize_prob=1.0, stroke_change_prob=1.0, blur=(2.5, 3.0),
+                              noise=(0.15, 0.2), min_resolution=0.3)
+    for seed in range(40):
+        result = harsh(canvas, np.random.default_rng(seed))
+        assert (result > 127).mean() >= harsh.min_ink * clean_ink
+
+    # if no try keeps the text, the clean rendering stands in
+    impossible = CaptureSimulation((128, 32), min_ink=50.0, max_ink=60.0)
+    np.testing.assert_array_equal(impossible(canvas, np.random.default_rng(0)), clean)

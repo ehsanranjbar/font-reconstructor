@@ -122,9 +122,13 @@ that history (`CaptureSimulation` in `font_reconstructor/dataset/capture.py`):
 1. slight rotation and perspective that deskewing did not remove
 2. ink spread or loss, lens blur and camera motion
 3. a dark-on-light photo with uneven lighting, sensor noise, limited resolution and JPEG compression
-4. the cleanup: background removal, contrast stretch, and for half of the images a threshold
+4. the cleanup: background removal, contrast stretch, and for half of the images a threshold. The paper
+   level is fitted as a plane, so the inside of heavy strokes stays ink.
 5. a crop to the text with a random margin and resizing to the model input. The crop never cuts into the
    text by default, because the dots and tails of letters at the edge tell fonts apart.
+
+A result that lost its text, as a hard threshold does to hairline strokes, is not used: the simulation
+runs again, and after three such results the clean rendering is used instead.
 
 Steps 2 and 4 make strokes thicker or thinner, which is what a real threshold does. Texts are rendered
 at `render_scale` times the model input, so these changes are finer than one pixel of the input.
