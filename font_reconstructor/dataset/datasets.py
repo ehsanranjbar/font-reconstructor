@@ -12,6 +12,8 @@ from .rendering import render_fingerprint, render_text
 DEFAULT_CACHE_DIR = 'data/cache'
 # share of the rendered image that the text takes up. The border leaves room for rotating and shifting the text.
 RENDER_FILL = 0.85
+# raised whenever rendering changes what it draws, so that caches of older renderings are not used
+RENDER_VERSION = 2
 _DIGITS = '۰۱۲۳۴۵۶۷۸۹0123456789'
 
 
@@ -91,7 +93,7 @@ class RandomTextImageDataset(Dataset):
             self._images_cache = self._prepare_images_cache()
 
     def _prepare_fingerprint_cache(self):
-        key = cache_key(self.fonts.signature(), self.font_fingerprint_dims)
+        key = cache_key(self.fonts.signature(), self.font_fingerprint_dims, RENDER_VERSION)
         width, height = self.font_fingerprint_dims
 
         def fill(array):
@@ -109,7 +111,7 @@ class RandomTextImageDataset(Dataset):
             self.text_length, self.text_image_dims, self.group_by_font,
             None if self._all_fonts else self.font_indices,
             None if self.corpus is None else self.corpus.signature(),
-            self.number_ratio, self.render_scale, RENDER_FILL,
+            self.number_ratio, self.render_scale, RENDER_FILL, RENDER_VERSION,
         )
         width, height = self.render_dims
 

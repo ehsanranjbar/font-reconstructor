@@ -387,6 +387,49 @@ def test_fit_to_box_crops_to_the_text():
     np.testing.assert_array_equal(clean_text_image(image, (128, 32)), fitted)
 
 
+def test_render_text_keeps_ink_that_starts_before_the_origin(fonts):
+    from PIL import Image, ImageDraw
+    from font_reconstructor.dataset import render_text
+
+    found_overhang = False
+    for index in range(len(fonts)):
+        ttf = fonts.ttf(index)
+        for text in ('j', 'f', 'jab', 'gab'):
+            left, top, right, bottom = ttf.getbbox(text, anchor='lt')
+            found_overhang |= left < 0 or top < 0
+
+            # the same text drawn with room on all sides, cut to its bounding box
+            pad = 40
+            reference = Image.new('L', (right - left + 2 * pad, bottom - top + 2 * pad), 0)
+            ImageDraw.Draw(reference).text((pad, pad), text, fill=255, anchor='lt', font=ttf)
+            reference = np.asarray(reference)[pad + top:pad + bottom, pad + left:pad + right]
+
+            rendered = render_text(ttf, text, (right - left, bottom - top))
+            np.testing.assert_array_equal(rendered, reference)
+    assert found_overhang, 'the test fonts should have a letter that reaches left of its origin'
+
+
+def test_crop_keeps_thin_and_faint_strokes():
+    from PIL import Image
+    from font_reconstructor.dataset.capture import ink_bbox
+
+    image = np.zeros((64, 256), dtype=np.uint8)
+    image[20:40, 100:140] = 255   # a letter
+    image[46:47, 110:130] = 110   # a faint hairline below it, like the tail or the dots of a letter
+    image[5, 5] = 255             # a single bright pixel of noise
+
+    left, top, right, bottom = ink_bbox(Image.fromarray(image))
+    # the hairline belongs to the text, the noise does not
+    assert bottom >= 47 and top <= 20 and left <= 100 and right >= 140
+    assert top > 6
+
+    fitted = np.asarray(fit_to_box(Image.fromarray(image), (128, 32)))
+    assert fitted[-4:].max() > 30, 'the hairline is at the bottom of the crop'
+
+    # by default the random crop of the capture simulation leaves a margin, it never cuts into the text
+    assert CaptureSimulation((128, 32)).margin[0] >= 0
+
+
 def test_capture_simulation(fonts):
     canvas = text_canvas(fonts)
     simulation = CaptureSimulation((128, 32))

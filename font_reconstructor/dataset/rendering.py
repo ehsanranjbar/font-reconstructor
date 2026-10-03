@@ -23,9 +23,11 @@ def render_text(
         left, top, right, bottom = ttf.getbbox(text, anchor="lt")
         (width, height) = (right - left, bottom - top)
 
+        # the bounding box is relative to the anchor and can start left of it or above it, for example for a
+        # letter that reaches back under its neighbour. Drawing at its offset keeps all of the ink in the image.
         img = Image.new("L", (width, height), 0)
         draw = ImageDraw.Draw(img)
-        draw.text((0, 0), text, fill=255, anchor="lt", font=ttf)
+        draw.text((-left, -top), text, fill=255, anchor="lt", font=ttf)
 
         inner = (max(1, int(dims[0] * fill)), max(1, int(dims[1] * fill)))
         scale = min(inner[0] / width, inner[1] / height)

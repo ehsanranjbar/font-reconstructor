@@ -18,11 +18,13 @@ from PIL import Image, ImageFilter
 _BLACK_WHITE_LUTS = {}
 
 
-def ink_bbox(image: Image.Image, threshold: int = 64) -> Optional[Tuple[int, int, int, int]]:
+def ink_bbox(image: Image.Image, threshold: int = 32) -> Optional[Tuple[int, int, int, int]]:
     """
     Bounding box (left, top, right, bottom) of the text of a white-on-black image, None if there is none.
 
-    The image is smoothed first, so that isolated bright pixels of noise do not count as text.
+    The image is smoothed first, so that isolated bright pixels of noise do not count as text. The threshold is
+    low, so that thin strokes and the dots of letters count: a box that is a bit too large only makes the text
+    smaller, one that is too small cuts parts of letters off.
     """
     if threshold not in _BLACK_WHITE_LUTS:
         _BLACK_WHITE_LUTS[threshold] = [255 if value >= threshold else 0 for value in range(256)]
@@ -100,8 +102,8 @@ class CaptureSimulation:
     :param min_resolution: lowest resolution of the photo, relative to the rendering
     :param jpeg_prob: share of the images that are compressed
     :param jpeg_quality: range of the compression quality
-    :param margin: range of the margin around the text on each side, as a fraction of the text height.
-        Negative values cut into the text.
+    :param margin: range of the margin around the text on each side, as a fraction of the text height. With
+        a negative lower end, crops can cut into the text, which loses the dots and tails of letters.
     """
 
     def __init__(
@@ -118,7 +120,7 @@ class CaptureSimulation:
         min_resolution: float = 0.5,
         jpeg_prob: float = 0.5,
         jpeg_quality: Tuple[int, int] = (25, 90),
-        margin: Tuple[float, float] = (-0.06, 0.25),
+        margin: Tuple[float, float] = (0.0, 0.25),
     ):
         self.dims = tuple(dims)
         self.binarize_prob = binarize_prob
