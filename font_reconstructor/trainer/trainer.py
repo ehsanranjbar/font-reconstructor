@@ -180,7 +180,8 @@ class Trainer(BaseTrainer):
 
             for name in self.train_metrics.keys:
                 if name in losses:
-                    self.train_metrics.update(name, float(losses[name]))
+                    value = losses[name]
+                    self.train_metrics.update(name, value.item() if torch.is_tensor(value) else value)
             for met in self.metric_ftns:
                 self.train_metrics.update(met.__name__, met(output, target))
 

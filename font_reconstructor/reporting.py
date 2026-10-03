@@ -73,7 +73,8 @@ class ValidationReport:
         if self._latent_sum is None:
             self._latent_sum = torch.zeros(latent.shape[1], dtype=torch.float64)
             self._latent_squares = torch.zeros(latent.shape[1], dtype=torch.float64)
-        latent_cpu = latent.double().cpu()
+        # moved to the cpu first: not every device has 64 bit floats, Apple's MPS backend does not
+        latent_cpu = latent.cpu().double()
         self._latent_sum += latent_cpu.sum(dim=0)
         self._latent_squares += (latent_cpu ** 2).sum(dim=0)
         fonts_needed = int(font_index.max()) + 1
