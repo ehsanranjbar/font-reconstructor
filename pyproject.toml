@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "font-reconstructor"
+version = "0.1.0"
+description = "Autoencoder that reconstructs a font's glyph fingerprint from a rendered text image"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.0",
+    "torchvision>=0.15",
+    "numpy>=1.24",
+    "pandas>=1.5",
+    "pillow>=10.0",
+    "tqdm>=4.65",
+    "matplotlib>=3.7",
+    "arabic-reshaper>=3.0",
+    "python-bidi>=0.4",
+    "tensorboard>=2.14",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "flake8>=6.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["font_reconstructor*"]
+
+[tool.setuptools.package-data]
+font_reconstructor = ["logger/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = [
+    "ignore::DeprecationWarning:tensorboard.*",
+    "ignore::DeprecationWarning:google.*",
+]

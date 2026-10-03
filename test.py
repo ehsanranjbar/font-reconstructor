@@ -1,78 +1,73 @@
 import argparse
 
-import numpy as np
 import torch
-from PIL import Image
-from tqdm import tqdm
 
-import data_loader.data_loaders as module_data
-import model.loss as module_loss
-import model.metric as module_metric
-import model.model as module_arch
-from parse_config import ConfigParser
+from font_reconstructor import factory
+from font_reconstructor.config import ConfigParser
+from font_reconstructor.evaluation import build_topk_accuracy, evaluate
+from font_reconstructor.trainer import strip_data_parallel_prefix
+from font_reconstructor.utils import prepare_device, seed_everything
 
 
 def main(config):
+    """
+    Evaluate a checkpoint on clean (not augmented) samples.
+
+    The validation split of the training data is used. If the config holds out no validation split, the
+    whole dataset is used instead.
+
+    :return: dict of the loss, metrics and top-k accuracies
+    """
     logger = config.get_logger('test')
+    assert config.resume is not None, "A checkpoint needs to be specified. Add '-r path/to/checkpoint.pth', for example."
+
+    seed_everything(config.get('seed', 42))
+    device, _ = prepare_device(config['n_gpu'], config.get('device', 'auto'))
+    logger.info('Using device: {}'.format(device))
 
     # setup data_loader instances
-    dl_test_args = config['data_loader']['args']
-    dl_test_args['batch_size'] = 512
-    dl_test_args['shuffle'] = False
-    dl_test_args['validation_split'] = 0.0
-    data_loader = getattr(module_data, config['data_loader']['type'])(**dl_test_args)
+    fonts = factory.build_fontset(config)
+    train_loader, valid_loader = factory.build_train_valid_loaders(
+        config, fonts, device, shuffle=False, random_augmentations=False)
+    data_loader = valid_loader if valid_loader is not None else train_loader
+    clustering_data_loader = factory.build_clustering_loader(config, fonts, device)
 
     # build model architecture
-    model = config.init_obj('arch', module_arch)
+    model = factory.build_model(config, fonts)
     logger.info(model)
 
     # get function handles of loss and metrics
-    loss_fn = getattr(module_loss, config['loss'])
-    metric_fns = [getattr(module_metric, met) for met in config['metrics']]
+    loss_fn = factory.build_criterion(config)
+    metric_fns = factory.build_metrics(config)
 
     logger.info('Loading checkpoint: {} ...'.format(config.resume))
-    checkpoint = torch.load(config.resume)
-    state_dict = checkpoint['state_dict']
-    if config['n_gpu'] > 1:
-        model = torch.nn.DataParallel(model)
-    model.load_state_dict(state_dict)
+    checkpoint = torch.load(config.resume, map_location='cpu')
+    model.load_state_dict(strip_data_parallel_prefix(checkpoint['state_dict']))
 
     # prepare model for testing
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
     model.eval()
 
-    total_loss = 0.0
-    total_metrics = torch.zeros(len(metric_fns)).to(device)
+    topk_acc = None
+    if clustering_data_loader is not None:
+        topk_acc = build_topk_accuracy(model, clustering_data_loader, device, len(fonts))
 
-    with torch.no_grad():
-        for i, (data, target) in enumerate(tqdm(data_loader)):
-            data, target = data.to(device), target.to(device)
-            output = model(data)
-
-            # computing loss, metrics on test set
-            loss = loss_fn(output, target)
-            batch_size = data.shape[0]
-            total_loss += loss.item() * batch_size
-            for i, metric in enumerate(metric_fns):
-                total_metrics[i] += metric(output, target) * batch_size
-
-    n_samples = len(data_loader.sampler)
-    log = {'loss': total_loss / n_samples}
-    log.update({
-        met.__name__: total_metrics[i].item() / n_samples for i, met in enumerate(metric_fns)
-    })
+    log = evaluate(
+        model, data_loader, loss_fn, metric_fns, device,
+        topk_acc=topk_acc, ks=config['trainer'].get('topk', (5, 10)), desc='Test',
+    )
     logger.info(log)
+    return log
 
 
 if __name__ == '__main__':
-    args = argparse.ArgumentParser(description='PyTorch Template')
+    args = argparse.ArgumentParser(description='Test the font reconstructor')
     args.add_argument('-c', '--config', default=None, type=str,
                       help='config file path (default: None)')
     args.add_argument('-r', '--resume', default=None, type=str,
                       help='path to latest checkpoint (default: None)')
     args.add_argument('-d', '--device', default=None, type=str,
-                      help='indices of GPUs to enable (default: all)')
+                      help='indices of CUDA GPUs to enable (default: all)')
 
     config = ConfigParser.from_args(args)
     main(config)

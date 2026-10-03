@@ -1,10 +1,13 @@
 import logging
 import logging.config
 from pathlib import Path
-from utils import read_json
+
+from font_reconstructor.utils import read_json
+
+DEFAULT_LOG_CONFIG = Path(__file__).parent / 'logger_config.json'
 
 
-def setup_logging(save_dir, log_config='logger/logger_config.json', default_level=logging.INFO):
+def setup_logging(save_dir, log_config=DEFAULT_LOG_CONFIG, default_level=logging.INFO):
     """
     Setup logging configuration
     """

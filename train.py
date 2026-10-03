@@ -1,45 +1,41 @@
 import argparse
 import collections
+
 import torch
-import numpy as np
-import data_loader.data_loaders as module_data
-import model.loss as module_loss
-import model.metric as module_metric
-import model.model as module_arch
-from parse_config import ConfigParser
-from trainer import Trainer
-from utils import prepare_device
 
-
-# fix random seeds for reproducibility
-SEED = 42
-torch.manual_seed(SEED)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
-np.random.seed(SEED)
+from font_reconstructor import factory
+from font_reconstructor.config import ConfigParser
+from font_reconstructor.trainer import Trainer
+from font_reconstructor.utils import prepare_device, seed_everything
 
 
 def main(config):
     logger = config.get_logger('train')
 
-    # setup data_loader instances
-    data_loader = config.init_obj('data_loader', module_data)
-    valid_data_loader = data_loader.split_validation()
-    clustering_data_loader = config.init_obj('clustering_data_loader', module_data)
-
-    # build model architecture, then print to console
-    model = config.init_obj('arch', module_arch)
-    logger.info(model)
+    # fix random seeds for reproducibility
+    seed_everything(config.get('seed', 42))
 
     # prepare for (multi-device) GPU training
-    device, device_ids = prepare_device(config['n_gpu'])
+    device, device_ids = prepare_device(config['n_gpu'], config.get('device', 'auto'))
+    logger.info('Using device: {}'.format(device))
+
+    # setup data_loader instances
+    fonts = factory.build_fontset(config)
+    data_loader, valid_data_loader = factory.build_train_valid_loaders(config, fonts, device)
+    clustering_data_loader = factory.build_clustering_loader(config, fonts, device)
+
+    # build model architecture, then print to console
+    model = factory.build_model(config, fonts)
+    factory.check_model_shapes(model, data_loader.dataset)
+    logger.info(model)
+
     model = model.to(device)
     if len(device_ids) > 1:
         model = torch.nn.DataParallel(model, device_ids=device_ids)
 
     # get function handles of loss and metrics
-    criterion = getattr(module_loss, config['loss'])
-    metrics = [getattr(module_metric, met) for met in config['metrics']]
+    criterion = factory.build_criterion(config)
+    metrics = factory.build_metrics(config)
 
     # build optimizer, learning rate scheduler. delete every lines containing lr_scheduler for disabling scheduler
     trainable_params = filter(lambda p: p.requires_grad, model.parameters())
@@ -52,19 +48,20 @@ def main(config):
                       data_loader=data_loader,
                       valid_data_loader=valid_data_loader,
                       clustering_data_loader=clustering_data_loader,
+                      num_fonts=len(fonts),
                       lr_scheduler=lr_scheduler)
 
     trainer.train()
 
 
 if __name__ == '__main__':
-    args = argparse.ArgumentParser(description='PyTorch Template')
+    args = argparse.ArgumentParser(description='Train the font reconstructor')
     args.add_argument('-c', '--config', default=None, type=str,
                       help='config file path (default: None)')
     args.add_argument('-r', '--resume', default=None, type=str,
                       help='path to latest checkpoint (default: None)')
     args.add_argument('-d', '--device', default=None, type=str,
-                      help='indices of GPUs to enable (default: all)')
+                      help='indices of CUDA GPUs to enable (default: all)')
 
     # custom cli options to modify configuration from default values given in json file.
     CustomArgs = collections.namedtuple('CustomArgs', 'flags type target')

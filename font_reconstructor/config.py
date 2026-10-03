@@ -1,11 +1,12 @@
-import os
 import logging
-from pathlib import Path
-from functools import reduce, partial
-from operator import getitem
+import os
 from datetime import datetime
-from logger import setup_logging
-from utils import read_json, write_json
+from functools import partial, reduce
+from operator import getitem
+from pathlib import Path
+
+from font_reconstructor.logger import setup_logging
+from font_reconstructor.utils import read_json, write_json
 
 
 class ConfigParser:
@@ -110,6 +111,12 @@ class ConfigParser:
     def __getitem__(self, name):
         """Access items like ordinary dict."""
         return self.config[name]
+
+    def __contains__(self, name):
+        return name in self.config
+
+    def get(self, name, default=None):
+        return self.config.get(name, default)
 
     def get_logger(self, name, verbosity=2):
         msg_verbosity = 'verbosity option {} is invalid. Valid options are {}.'.format(verbosity, self.log_levels.keys())

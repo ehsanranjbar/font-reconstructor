@@ -1,65 +1,50 @@
 {
     "name": "AE2_256",
+    "seed": 42,
     "n_gpu": 1,
+    "device": "auto",
     "arch": {
-        "type": "AE2",
+        "type": "AutoEncoder",
         "args": {
             "latent_dim": 256,
             "batch_norm": false
         }
     },
+    "dataset": {
+        "fonts_dir": "data/fonts",
+        "annotation_file": "data/fonts.csv",
+        "font_size": 32,
+        "text_length": [
+            3,
+            8
+        ],
+        "text_image_dims": [
+            128,
+            32
+        ],
+        "font_fingerprint_dims": [
+            32,
+            32
+        ],
+        "cache_dir": "data/cache"
+    },
     "data_loader": {
-        "type": "RTIDataLoader",
         "args": {
-            "fonts_dir": "data/fonts",
-            "annotation_file": "data/fonts.csv",
             "random_seed": 42,
             "total_samples": 1000000,
-            "font_size": 32,
-            "text_length": [
-                3,
-                8
-            ],
-            "text_image_dims": [
-                128,
-                32
-            ],
-            "font_fingerprint_dims": [
-                32,
-                32
-            ],
+            "random_augmentations": true,
+            "validation_split": 0.1,
             "batch_size": 128,
             "shuffle": true,
-            "validation_split": 0.1,
             "num_workers": 12,
             "pin_memory": true
         }
     },
     "clustering_data_loader": {
-        "type": "RTIDataLoader",
         "args": {
-            "fonts_dir": "data/fonts",
-            "annotation_file": "data/fonts.csv",
             "random_seed": 123,
-            "total_samples": 1153000,
-            "font_size": 32,
-            "text_length": [
-                3,
-                8
-            ],
-            "text_image_dims": [
-                128,
-                32
-            ],
-            "font_fingerprint_dims": [
-                32,
-                32
-            ],
-            "group_by_font": true,
-            "random_augmentions": false,
+            "samples_per_font": 100,
             "batch_size": 128,
-            "shuffle": false,
-            "validation_split": 0.0,
             "num_workers": 12,
             "pin_memory": true
         }
@@ -85,9 +70,14 @@
         "epochs": 200,
         "save_dir": "saved/",
         "save_period": 1,
+        "keep_last_checkpoints": 5,
         "verbosity": 2,
         "monitor": "min val_loss",
         "early_stop": 10,
+        "topk": [
+            5,
+            10
+        ],
         "tensorboard": true
     }
 }
