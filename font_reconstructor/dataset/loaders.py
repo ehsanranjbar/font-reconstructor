@@ -80,6 +80,8 @@ def make_train_valid_loaders(
     """
     Build a training loader and a validation loader over disjoint sets of fonts.
 
+    Synthetic variants of fonts are trained on, but not validated on.
+
     `validation_split` holds out whole font families, see `split_fonts`. `total_samples` is divided between
     the two datasets in proportion to their number of fonts.
     The validation set is read in a fixed order and has the same number of samples of every font.
@@ -97,6 +99,10 @@ def make_train_valid_loaders(
         random_seed = int(np.random.randint(0, 2**31 - 1))
 
     train_fonts, valid_fonts = split_fonts(fonts, validation_split, seed=split_seed)
+    if valid_fonts is not None:
+        # validation measures real fonts only. The synthetic variants of held out fonts are not trained on
+        # either, since they are in the family of their font: they only stand among the fonts to choose from.
+        valid_fonts = np.array([index for index in valid_fonts if not fonts.is_synthetic(index)])
     n_valid = 0 if valid_fonts is None else max(1, round(total_samples * len(valid_fonts) / len(fonts)))
     n_train = total_samples - n_valid
     if n_train < 1:

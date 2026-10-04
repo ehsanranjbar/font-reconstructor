@@ -1,16 +1,36 @@
 import math
+import shutil
 
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
 from font_reconstructor.evaluation import build_topk_accuracy, evaluate
+from font_reconstructor.logger.figures import save_figure
 from font_reconstructor.model.loss import adversarial_loss, discriminator_loss
+from font_reconstructor.model.model import select_glyphs
 from font_reconstructor.model.metric import style_accuracy
 from font_reconstructor.reporting import ValidationReporter, base_dataset
 from font_reconstructor.utils import MetricTracker, inf_loop, move_model_to_cpu
 
 from .base_trainer import BaseTrainer
+
+
+def pick_glyphs(seen, count):
+    """
+    Pick `count` glyphs of each sample at random among those its text shows.
+
+    A sample that shows fewer than `count` glyphs gets them all and some of them again. One that shows none
+    gets a single arbitrary glyph, so that the result always has the same shape.
+
+    :param seen: bool tensor (batch, glyphs), True for the glyphs that occur in the text of a sample
+    :return: tensor (batch, count) of glyph indices
+    """
+    # a random order of the glyphs of each sample, with those of its text first
+    order = (torch.rand(seen.shape, device=seen.device) + seen).argsort(dim=1, descending=True)
+    available = seen.sum(dim=1, keepdim=True).clamp(min=1)
+    positions = torch.arange(count, device=seen.device).unsqueeze(0) % available
+    return order.gather(1, positions)
 
 
 class Trainer(BaseTrainer):
@@ -36,12 +56,23 @@ class Trainer(BaseTrainer):
     :param style_weight: weight of the cross-entropy loss of the model's style head. With it, `style_loss` and
         `style_acc` are logged for training, and `style_acc` and `style_balanced_acc` for validation.
     :param style_detach: train the style head on the latent vector without letting it shape the encoder
+    :param target_glyphs: 'all' to train the reconstruction on the whole fingerprint, 'text' to train it only
+        on glyphs that occur in the text of each sample. The model is not asked to guess glyphs it has not
+        seen then, and a conditioned decoder only draws a few glyphs of each sample, which makes it affordable.
+        Validation always draws the whole fingerprint.
+    :param glyphs_per_sample: number of glyphs drawn for each sample with target_glyphs 'text'. They are picked
+        at random from the glyphs of its text. A text with fewer glyphs gets some of them twice, so that every
+        batch has the same shape and every sample the same weight.
 
     The logged `loss` is the reconstruction loss in training and in validation, so the two are comparable.
+    With `target_glyphs` 'text' the training loss covers the glyphs of the text only: compare it with
+    `val_seen_glyph_loss`, which is a plain pixel error and not the configured loss, so only roughly.
     The other terms and their weighted sum `total_loss` are logged for training too.
 
-    Validation also logs the scalars of ValidationReport, and with tensorboard enabled it writes the figures of
-    ValidationReporter every `figure_period` epochs (a setting of the trainer config, 1 by default).
+    Validation also logs the scalars of ValidationReport, and every `figure_period` epochs it draws the figures of
+    ValidationReporter. They go to tensorboard if that is enabled, and with `save_figures` they are written as
+    image files to `figures/` in the log directory of the run, at `figure_dpi` dots per inch. These are settings
+    of the trainer config.
     """
 
     def __init__(self, model, criterion, metric_ftns, optimizer, config, device,
@@ -49,8 +80,17 @@ class Trainer(BaseTrainer):
                  lr_scheduler=None, lr_scheduler_interval='epoch', len_epoch=None,
                  contrastive_criterion=None, contrastive_weight=1.0,
                  discriminator=None, discriminator_optimizer=None, adversarial_weight=0.0,
-                 adversarial_start_epoch=1, style_weight=0.0, style_detach=False):
+                 adversarial_start_epoch=1, style_weight=0.0, style_detach=False, target_glyphs='all',
+                 glyphs_per_sample=8):
         super().__init__(model, criterion, metric_ftns, optimizer, config)
+        if target_glyphs not in ('all', 'text'):
+            raise ValueError(f"Unknown target_glyphs '{target_glyphs}', use 'all' or 'text'.")
+        if target_glyphs == 'text' and discriminator is not None and adversarial_weight:
+            raise ValueError("The adversarial loss judges whole fingerprints, it needs target_glyphs 'all'.")
+        self.target_glyphs = target_glyphs
+        self.glyphs_per_sample = int(glyphs_per_sample)
+        if self.glyphs_per_sample < 1:
+            raise ValueError("glyphs_per_sample has to be at least 1.")
         self.style_weight = style_weight
         self.style_detach = style_detach
         if self.style_weight and getattr(self.core_model, 'style_head', None) is None:
@@ -98,6 +138,9 @@ class Trainer(BaseTrainer):
 
         # the fixed panel of samples and the baseline that every validation is compared on
         self.figure_period = max(1, int(config['trainer'].get('figure_period', 1)))
+        self.save_figures = bool(config['trainer'].get('save_figures', True))
+        self.figure_dpi = int(config['trainer'].get('figure_dpi', 200))
+        self.figure_dir = config.log_dir / 'figures'
         self.reporter = None
         if self.do_validation:
             self.reporter = ValidationReporter(self.valid_data_loader.dataset, data_loader.dataset)
@@ -132,9 +175,15 @@ class Trainer(BaseTrainer):
                  configured. `style_acc` is a float.
         """
         data, target = batch['image'].to(self.device), batch['target'].to(self.device)
-        output, latent = self.model(data, return_latent=True)
-
-        losses = {'loss': self.criterion(output, target)}
+        if self.target_glyphs == 'text':
+            # only some glyphs of each text are drawn and compared
+            glyphs = pick_glyphs(batch['seen'].to(self.device), self.glyphs_per_sample)
+            output, latent = self.model(data, return_latent=True, glyphs=glyphs)
+            target = select_glyphs(target, glyphs)
+            losses = {'loss': self.criterion(output, target)}
+        else:
+            output, latent = self.model(data, return_latent=True)
+            losses = {'loss': self.criterion(output, target)}
         total_loss = losses['loss']
         if self.contrastive_criterion is not None:
             losses['contrastive_loss'] = self.contrastive_criterion(latent, batch['font_index'].to(self.device))
@@ -185,8 +234,12 @@ class Trainer(BaseTrainer):
             for met in self.metric_ftns:
                 self.train_metrics.update(met.__name__, met(output, target))
 
-            # add stuff to progress bar in the end
-            train_loop.set_postfix(loss='{:.4f}'.format(self.train_metrics.avg('loss')))
+            # the progress bar shows the loss that is optimized, and beside it the reconstruction loss if the
+            # two differ
+            shown = {'loss': '{:.4f}'.format(self.train_metrics.avg('loss'))}
+            if 'total_loss' in self.train_metrics.keys:
+                shown = {'total_loss': '{:.4f}'.format(self.train_metrics.avg('total_loss')), 'recon': shown['loss']}
+            train_loop.set_postfix(shown)
 
             if batch_idx + 1 >= self.len_epoch:
                 break
@@ -205,6 +258,17 @@ class Trainer(BaseTrainer):
             else:
                 self.lr_scheduler.step()
         return log
+
+    def _save_figure(self, tag, figure, epoch):
+        """
+        Write a figure into the log directory of the run, twice: under its own name with the epoch, so that the
+        epochs of one figure sit side by side, and under `latest`, which always holds the newest of each figure.
+        """
+        name = tag.replace('/', '_')
+        path = save_figure(figure, self.figure_dir / name / f'epoch_{epoch:03d}.png', dpi=self.figure_dpi)
+        latest = self.figure_dir / 'latest' / f'{name}.png'
+        latest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(path, latest)
 
     def _train_discriminator(self, output, target):
         """
@@ -245,9 +309,12 @@ class Trainer(BaseTrainer):
             topk_acc=topk_acc, ks=self.topk, on_batch=on_batch, report=report,
         )
 
-        if self.writer.enabled and epoch % self.figure_period == 0:
+        if (self.writer.enabled or self.save_figures) and epoch % self.figure_period == 0:
             for tag, figure in self.reporter.figures(self.core_model, self.device, report, topk_acc).items():
-                self.writer.add_figure(tag, figure)
+                if self.save_figures:
+                    self._save_figure(tag, figure, epoch)
+                if self.writer.enabled:
+                    self.writer.add_figure(tag, figure)
 
         # add embedding to tensorboard, with the font, its family and its style to color the points by
         if log_embeddings and embeddings:

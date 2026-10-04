@@ -37,6 +37,7 @@ class ValidationReport:
         self.style_prediction = []
         self.text_length = []
         self.latent_norms = []
+        self.latents = []
         self._latent_sum = None
         self._latent_squares = None
         self._font_latent_sum = None  # sums of the latent vectors of each font, to tell fonts from texts
@@ -70,6 +71,7 @@ class ValidationReport:
         # latent statistics
         latent = latent.float()
         self.latent_norms.append(latent.norm(dim=1).cpu().numpy())
+        self.latents.append(latent.cpu().numpy())
         if self._latent_sum is None:
             self._latent_sum = torch.zeros(latent.shape[1], dtype=torch.float64)
             self._latent_squares = torch.zeros(latent.shape[1], dtype=torch.float64)
@@ -212,6 +214,82 @@ class ValidationReport:
         between = (weights * (font_means - mean) ** 2).sum(dim=0)
         return (between / total).clamp(0, 1).numpy()
 
+    def font_separation(self):
+        """
+        What each latent dimension adds to telling fonts apart, and what it adds to mixing them up.
+
+        The latent vectors are scaled to unit length first, as the cosine similarity does when fonts are
+        matched. The variance of each dimension is then split in two: the part between the fonts, which is
+        what separates their clusters, and the part inside a font, which changes with the text and the
+        capture and spreads a cluster out.
+
+        :return: (between, within), arrays (latent_dim,) of shares of the total variance of the vectors. All
+                 of them together add up to 1.
+        """
+        latent = np.concatenate(self.latents).astype(np.float64)
+        latent /= np.maximum(np.linalg.norm(latent, axis=1, keepdims=True), 1e-12)
+        font_index = np.concatenate(self.font_index).astype(np.int64)
+
+        mean = latent.mean(axis=0)
+        total = latent.var(axis=0)
+        counts = np.bincount(font_index)
+        sums = np.zeros((len(counts), latent.shape[1]))
+        np.add.at(sums, font_index, latent)
+        present = counts > 0
+        font_means = sums[present] / counts[present, None]
+        between = (counts[present, None] / len(latent) * (font_means - mean) ** 2).sum(axis=0)
+        within = np.maximum(total - between, 0.0)
+        scale = max(float(total.sum()), 1e-12)
+        return between / scale, within / scale
+
+    @torch.no_grad()
+    def accuracy_by_dimensions(self, topk_acc, ks: Sequence[int] = (1, 5), max_samples: int = 20_000):
+        """
+        How well fonts are identified with only some of the latent dimensions.
+
+        The dimensions are taken in the order of what they add to telling fonts apart, see
+        `font_separation`. With the first n of them, the samples are matched to the font centroids by the
+        cosine similarity of those n dimensions alone.
+
+        :param topk_acc: the TopKCosimAccuracy of this validation, for its font centroids
+        :param ks: the k values of the top-k accuracies
+        :param max_samples: at most this many samples are matched, evenly spread over the validation set
+        :return: (order, accuracy). order is an array (latent_dim,) of dimensions, the most useful first.
+                 accuracy is an array (len(ks), latent_dim), its column n - 1 is for the first n dimensions.
+                 A font tied with the true font counts as a better match.
+        """
+        between, _ = self.font_separation()
+        order = np.argsort(-between, kind='stable')
+
+        latent = np.concatenate(self.latents)
+        font_index = np.concatenate(self.font_index).astype(np.int64)
+        if len(latent) > max_samples:
+            picks = np.linspace(0, len(latent) - 1, max_samples).round().astype(np.int64)
+            latent, font_index = latent[picks], font_index[picks]
+
+        centroids = topk_acc.centroids[torch.as_tensor(order, device=topk_acc.centroids.device)]
+        device = centroids.device
+        hits = torch.zeros(len(ks), len(order), device=device)
+        for start in range(0, len(latent), 4096):
+            chunk = torch.as_tensor(latent[start:start + 4096][:, order], device=device)
+            true_font = torch.as_tensor(font_index[start:start + 4096], device=device)
+            known = torch.ones_like(true_font, dtype=torch.bool) if topk_acc.valid is None \
+                else topk_acc.valid[true_font]
+            dot = torch.zeros(len(chunk), centroids.shape[1], device=device)
+            centroid_squares = torch.zeros(centroids.shape[1], device=device)
+            for n in range(len(order)):
+                dot += chunk[:, n:n + 1] * centroids[n].unsqueeze(0)
+                centroid_squares += centroids[n] ** 2
+                # the length of the sample scales all of its similarities alike, it does not change their order
+                similarity = dot / centroid_squares.clamp(min=1e-12).sqrt()
+                if topk_acc.valid is not None:
+                    similarity = similarity.masked_fill(~topk_acc.valid, float('-inf'))
+                true_similarity = similarity.gather(1, true_font.unsqueeze(1))
+                rank = (similarity >= true_similarity).sum(dim=1)
+                for row, k in enumerate(ks):
+                    hits[row, n] += ((rank <= k) & known).sum()
+        return order, (hits / len(latent)).cpu().numpy()
+
     def latent_spread(self):
         """
         :return: array (latent_dim,), the standard deviation of each latent dimension over the samples
@@ -323,6 +401,7 @@ class ValidationReporter:
         self.base = base_dataset(valid_dataset)
         self.fonts = getattr(self.base, 'fonts', None)
         self.worst_cases = worst_cases
+        self.dimension_ks = (1, 5)  # the top-k accuracies drawn against the number of latent dimensions
 
         target_transform = getattr(valid_dataset, 'target_transform', None)
         self.target_transform = target_transform
@@ -448,7 +527,11 @@ class ValidationReporter:
 
         if report.samples:
             norms = np.concatenate(report.latent_norms)
-            result['latent_space'] = figures.plot_latent_health(report.latent_spread(), norms)
+            accuracy = None
+            if topk_acc is not None:
+                accuracy = report.accuracy_by_dimensions(topk_acc, ks=self.dimension_ks)[1]
+            result['latent_space'] = figures.plot_latent_health(
+                report.latent_spread(), norms, report.font_separation(), accuracy, self.dimension_ks)
             if self.panel_indices:
                 result['latent_comparison'] = self.latent_comparison_figure(model, device, report)
 

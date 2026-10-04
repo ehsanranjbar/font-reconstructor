@@ -6,7 +6,7 @@ import pytest
 import torch
 from PIL import features
 
-from font_reconstructor.dataset import (CaptureSimulation, FontBalancedBatchSampler, FontSet, RandomTextImageDataset,
+from font_reconstructor.dataset import (CaptureSimulation, FontBalancedBatchSampler, FontSet, RandomTextImageDataset, Variant,
                                         TextCorpus, clean_text_image, derive_style, fit_to_box, image_transform,
                                         make_clustering_loader, make_train_valid_loaders, normalize_text,
                                         resolve_layout_engine, split_fonts)
@@ -88,6 +88,16 @@ def test_sample_layout(fonts, tmp_path):
     assert sample['font'] == fonts.names[sample['font_index']]
     assert fonts.style_names[sample['style_index']] == fonts.styles[sample['font_index']]
     assert 3 <= len(sample['text']) < 8
+
+    # the glyphs of the fingerprint that the text shows
+    assert sample['seen'].shape == (8,) and sample['seen'].dtype == bool
+    glyphs = fonts.glyphs(sample['font_index'])
+    assert [glyph in sample['text'] for glyph in glyphs] == sample['seen'][:len(glyphs)].tolist()
+    assert sample['seen'].any()
+    dataset = make_dataset(fonts, tmp_path)
+    # font 0 leaves two glyph slots empty, they are never seen
+    assert dataset.seen_glyphs(0, 'abh').tolist() == [True, True] + [False] * 6
+    assert 'seen' not in make_dataset(fonts, tmp_path, return_target=False, cache_images=False)[0]
 
 
 def test_null_characters_leave_their_channel_empty(fonts, tmp_path):
@@ -575,18 +585,164 @@ def test_cleanup_keeps_heavy_strokes_solid():
             assert np.median(cleaned[:3]) < 60, 'the paper above the stroke stays dark'
 
 
-def test_capture_simulation_never_returns_an_image_without_its_text(fonts):
-    canvas = text_canvas(fonts)
-    clean = clean_text_image(canvas, (128, 32))
-    clean_ink = (clean > 127).mean()
+def test_text_agreement_tells_text_from_damage(fonts):
+    from PIL import Image, ImageFilter
+    from font_reconstructor.dataset.capture import text_agreement
 
-    # an erosion that wipes out the strokes, followed by a hard threshold: most tries lose the text
-    harsh = CaptureSimulation((128, 32), binarize_prob=1.0, stroke_change_prob=1.0, blur=(2.5, 3.0),
-                              noise=(0.15, 0.2), min_resolution=0.3)
-    for seed in range(40):
-        result = harsh(canvas, np.random.default_rng(seed))
-        assert (result > 127).mean() >= harsh.min_ink * clean_ink
+    text = Image.fromarray(text_canvas(fonts))
+    assert text_agreement(text, text) == pytest.approx(1.0)
+    # what a capture does to text that survives it: softer, smaller, thicker
+    assert text_agreement(text, text.filter(ImageFilter.GaussianBlur(1.5))) > 0.9
+    assert text_agreement(text, text.resize((128, 32))) > 0.9
+    assert text_agreement(text, text.filter(ImageFilter.MaxFilter(3))) > 0.8
+
+    # what leaves no text: noise, a blank image, half of the image taken for ink
+    noise = np.random.default_rng(0).integers(0, 2, size=(64, 256), dtype=np.uint8) * 255
+    assert abs(text_agreement(text, Image.fromarray(noise))) < 0.2
+    assert text_agreement(text, Image.new('L', text.size, 0)) == 0.0
+    band = np.asarray(text).copy()
+    band[32:] = 255
+    assert text_agreement(text, Image.fromarray(band)) < 0.6
+
+
+def test_capture_simulation_never_returns_an_image_without_its_text():
+    # a grid of lines one pixel thick, the kind of text that blur and noise wipe out
+    canvas = np.zeros((64, 256), dtype=np.uint8)
+    canvas[12:52:8, 30:226] = 255
+    canvas[12:52, 30:226:14] = 255
+    clean = clean_text_image(canvas, (128, 32))
+
+    def fallbacks(**kwargs):
+        simulation = CaptureSimulation((128, 32), **kwargs)
+        return sum(np.array_equal(simulation(canvas, np.random.default_rng(seed)), clean) for seed in range(40))
+
+    harsh = {'binarize_prob': 1.0, 'blur': (2.5, 3.0), 'noise': (0.15, 0.2), 'min_resolution': 0.3}
+    # nearly every try loses the lines, and the clean rendering stands in for a result without them
+    assert fallbacks(**harsh) >= 30
+    # without the check the damaged images are returned
+    assert fallbacks(min_agreement=-1.0, **harsh) == 0
+    # the default settings leave even hairlines readable, so they are not replaced by clean images
+    assert fallbacks() <= 2
 
     # if no try keeps the text, the clean rendering stands in
-    impossible = CaptureSimulation((128, 32), min_ink=50.0, max_ink=60.0)
+    impossible = CaptureSimulation((128, 32), min_agreement=1.1)
     np.testing.assert_array_equal(impossible(canvas, np.random.default_rng(0)), clean)
+
+
+def test_bright_paper_is_not_taken_for_ink(fonts):
+    from PIL import Image
+    from font_reconstructor.dataset.capture import text_agreement
+
+    # text under strongly uneven light, which would blow out the bright side of a photo
+    simulation = CaptureSimulation((128, 32), lighting=0.6, noise=(0.0, 0.0), jpeg_prob=0.0, min_resolution=1.0)
+    text = Image.fromarray(text_canvas(fonts))
+    for seed in range(40):
+        rng = np.random.default_rng(seed)
+        photo = simulation._photograph(text, rng)
+        # the lit paper stays a plane, it is not cut off at white
+        assert (np.asarray(photo) >= 255).mean() < 0.01, seed
+        assert text_agreement(text, simulation._clean_up(photo, rng)) > 0.95, seed
+
+
+def test_stroke_changes_spare_hairlines():
+    from PIL import Image
+
+    simulation = CaptureSimulation((128, 32), stroke_change_prob=1.0, blur=(0.01, 0.01), motion_blur_prob=0.0)
+    hairlines = np.zeros((64, 256), dtype=np.uint8)
+    hairlines[10:54:6, 20:236] = 255   # lines one pixel thick with five pixels between them
+    heavy = np.zeros((64, 256), dtype=np.uint8)
+    heavy[16:48, 40:216] = 255
+
+    changed_heavy = 0
+    for seed in range(20):
+        thin = np.asarray(simulation._print_and_focus(Image.fromarray(hairlines), np.random.default_rng(seed)))
+        # neither wiped out nor thickened to three times their width
+        assert 0.6 * hairlines.sum() <= thin.astype(np.float64).sum() <= 1.6 * hairlines.sum(), seed
+        thick = np.asarray(simulation._print_and_focus(Image.fromarray(heavy), np.random.default_rng(seed)))
+        changed_heavy += abs(float(thick.astype(np.float64).sum()) / heavy.sum() - 1.0) > 0.03
+    assert changed_heavy == 20, 'strokes that can bear it are still thickened or thinned'
+
+
+def test_variants_draw_a_font_as_another_style(fonts):
+    from font_reconstructor.dataset import render_fingerprint, render_text
+
+    ttf = fonts.ttf(1)
+    plain = render_text(ttf, 'bad', (256, 64))
+    outline = render_text(ttf, 'bad', (256, 64), variant=Variant(outline=0.05))
+    heavy = render_text(ttf, 'bad', (256, 64), variant=Variant(weight=0.05))
+    slanted = render_text(ttf, 'l', (64, 64), variant=Variant(slant=0.3))
+    upright = render_text(ttf, 'l', (64, 64))
+
+    def ink(image):
+        return (image > 127).mean()
+
+    # a heavier weight has more ink
+    assert ink(heavy) > 1.3 * ink(plain)
+    # an outline is hollow: where the filled stem of the b is, the outlined one is dark in the middle
+    filled_columns = (plain > 127).sum(axis=0)
+    stem = int(np.argmax(filled_columns))
+    assert (outline[:, stem] > 127).sum() < 0.5 * filled_columns[stem]
+
+    # a positive slant leans the top of a stem to the left of its foot
+    def centre(image, rows):
+        columns = np.where(image[rows] > 127)[1]
+        return columns.mean()
+    top, bottom = slice(8, 20), slice(44, 56)
+    assert abs(centre(upright, top) - centre(upright, bottom)) < 1.5
+    assert centre(slanted, top) < centre(slanted, bottom) - 3
+
+    fingerprint = render_fingerprint(ttf, 'ab', (32, 32), 2, variant=Variant(outline=0.05))
+    assert fingerprint.shape == (32, 32, 2)
+    assert not np.array_equal(fingerprint, render_fingerprint(ttf, 'ab', (32, 32), 2))
+
+
+def test_synthetic_variants_are_fonts_of_their_own(fonts_dir, tmp_path):
+    root, annotation_file = fonts_dir
+    counts = {'outline': 2, 'italic': 5}
+    fonts = FontSet(str(root), str(annotation_file), synthetic_variants=counts)
+
+    # three real fonts, two outlines and, since there are only three fonts to slant, three italics
+    assert len(fonts) == 3 + 2 + 3
+    assert [fonts.is_synthetic(index) for index in range(len(fonts))] == [False] * 3 + [True] * 5
+    assert fonts.styles == ['regular'] * 3 + ['outline'] * 2 + ['italic'] * 3
+    assert fonts.style_names == ['italic', 'outline', 'regular']
+    assert len(set(fonts.names)) == len(fonts)
+    for index in range(3, len(fonts)):
+        base = fonts.files.index(fonts.files[index])
+        # a variant is drawn from the file of its font and belongs to its family
+        assert fonts.names[index].startswith(fonts.names[base])
+        assert fonts.families[index] == fonts.families[base]
+        assert fonts.charsets[index] == fonts.charsets[base]
+
+    # the same choice every time, and part of what a cache depends on
+    again = FontSet(str(root), str(annotation_file), synthetic_variants=counts)
+    assert again.names == fonts.names
+    assert again.signature() == fonts.signature()
+    assert fonts.signature() != FontSet(str(root), str(annotation_file)).signature()
+
+    with pytest.raises(ValueError, match='shadow'):
+        FontSet(str(root), str(annotation_file), synthetic_variants={'shadow': 1})
+
+    # the dataset draws a variant differently from its font, text and fingerprint alike
+    dataset = make_dataset(fonts, tmp_path, total_samples=8, group_by_font=True, cache_images=False,
+                           cache_fingerprints=False)
+    variant = 3
+    base = fonts.files.index(fonts.files[variant])
+    assert not np.array_equal(dataset.generate_text_image(variant, 'bad'), dataset.generate_text_image(base, 'bad'))
+    assert not np.array_equal(dataset.generate_font_fingerprint(variant), dataset.generate_font_fingerprint(base))
+
+
+def test_synthetic_variants_are_not_validated_on(fonts_dir, tmp_path):
+    root, annotation_file = fonts_dir
+    fonts = FontSet(str(root), str(annotation_file), synthetic_variants={'outline': 3, 'italic': 3})
+    train_loader, valid_loader = make_train_valid_loaders(
+        fonts, random_seed=7, total_samples=90, validation_split=0.34, batch_size=8, num_workers=0,
+        cache_dir=str(tmp_path / 'cache'),
+    )
+    train_fonts = set(train_loader.dataset.dataset.font_indices)
+    valid_fonts = set(valid_loader.dataset.dataset.font_indices)
+    assert valid_fonts and not any(fonts.is_synthetic(index) for index in valid_fonts)
+    assert any(fonts.is_synthetic(index) for index in train_fonts)
+    # the variants of a held out font are in its family, so they are not trained on
+    held_out_families = {fonts.families[index] for index in valid_fonts}
+    assert not any(fonts.families[index] in held_out_families for index in train_fonts)

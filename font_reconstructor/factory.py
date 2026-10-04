@@ -11,7 +11,7 @@ import font_reconstructor.model.metric as module_metric
 import font_reconstructor.model.model as module_arch
 from font_reconstructor.dataset import FontSet, TextCorpus, make_clustering_loader, make_train_valid_loaders
 
-_FONTSET_KEYS = ('fonts_dir', 'annotation_file', 'font_size', 'layout_engine')
+_FONTSET_KEYS = ('fonts_dir', 'annotation_file', 'font_size', 'layout_engine', 'synthetic_variants')
 _RENDER_KEYS = ('text_length', 'text_image_dims', 'font_fingerprint_dims', 'number_ratio', 'render_scale', 'cache_dir')
 _DATASET_KEYS = _FONTSET_KEYS + _RENDER_KEYS + ('corpus_files', 'capture')
 # keys of the clustering loader in configs written before the shared `dataset` block, they have no effect anymore
@@ -215,6 +215,21 @@ def build_style_head(config):
     if not weight:
         return {}
     return {'style_weight': weight, 'style_detach': bool(cfg.get('detach', False))}
+
+
+def build_reconstruction(config):
+    """
+    Which glyphs the reconstruction is trained on, configured by the `reconstruction` block.
+
+    :return: dict of Trainer arguments (target_glyphs, glyphs_per_sample), empty if it is not configured
+    """
+    cfg = config.get('reconstruction') or {}
+    arguments = {}
+    if 'glyphs' in cfg:
+        arguments['target_glyphs'] = cfg['glyphs']
+    if 'glyphs_per_sample' in cfg:
+        arguments['glyphs_per_sample'] = cfg['glyphs_per_sample']
+    return arguments
 
 
 def build_adversarial(config, fonts, device):

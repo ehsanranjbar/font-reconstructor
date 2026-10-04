@@ -9,6 +9,26 @@ def l1_loss(output, target):
     return F.l1_loss(output, target)
 
 
+def multiscale_l1_loss(output, target, scales=(1, 2, 4, 8)):
+    """
+    Mean absolute error of the images and of their averages over blocks of 2, 4 and 8 pixels.
+
+    Pixel by pixel, a stroke that is drawn one pixel off costs twice, once where it is missing and once where
+    it is, so a model that is unsure where a thin stroke goes does best by drawing nothing. In the averaged
+    images a stroke that is slightly off still matches, which pays for drawing it at all. The first scale
+    keeps asking for the exact shape.
+
+    :param scales: block sizes, 1 is the image itself. Scales larger than the image are left out.
+    """
+    losses = []
+    for scale in scales:
+        if scale == 1:
+            losses.append(F.l1_loss(output, target))
+        elif min(output.shape[-2:]) >= scale:
+            losses.append(F.l1_loss(F.avg_pool2d(output, scale), F.avg_pool2d(target, scale)))
+    return torch.stack(losses).mean()
+
+
 def mse_loss(output, target):
     return F.mse_loss(output, target)
 

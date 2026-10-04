@@ -8,7 +8,8 @@ from font_reconstructor.model.loss import l1_loss
 from font_reconstructor.logger import figures
 from font_reconstructor.model.metric import style_accuracy
 from font_reconstructor.reporting import ValidationReport
-from font_reconstructor.model.loss import adversarial_loss, discriminator_loss, supervised_contrastive_loss
+from font_reconstructor.model.loss import (adversarial_loss, discriminator_loss, multiscale_l1_loss,
+                                           supervised_contrastive_loss)
 from font_reconstructor.model.metric import TopKCosimAccuracy
 from font_reconstructor.utils import MetricTracker, prepare_device
 
@@ -329,6 +330,13 @@ def test_figures_render():
     draw(figures.plot_bars(['bold', 'regular'], np.array([0.25, 1.0]), np.array([10, 2000]), 'Title', 'Subtitle'))
     draw(figures.plot_confusion(['bold', 'regular', 'shadow'], np.array([[5, 1, 0], [2, 8, 0], [0, 0, 0]])))
     draw(figures.plot_latent_health(rng.uniform(0, 2, 16), rng.uniform(1, 9, 200)))
+    separation = (rng.uniform(0, 0.04, 16), rng.uniform(0, 0.02, 16))
+    draw(figures.plot_latent_health(rng.uniform(0, 2, 16), rng.uniform(1, 9, 200), separation))
+    accuracy = np.stack([np.linspace(0.05, 0.6, 16), np.linspace(0.1, 0.9, 16)])
+    width, height = draw(figures.plot_latent_health(rng.uniform(0, 2, 16), rng.uniform(1, 9, 200), separation, accuracy))
+    assert height > 700, 'the figure grows by a row for the curve'
+    # an accuracy of zero and a single k are drawn too
+    draw(figures.plot_latent_health(np.ones(4), np.ones(10), (np.zeros(4), np.zeros(4)), np.zeros((1, 4)), ks=(1,)))
     draw(figures.plot_latent_comparison(
         rng.normal(size=(6, 16)), [0, 0, 0, 1, 1, 1], ['A Font'] * 3 + ['Other'] * 3, ['متن', '۱۲', 'abc'] * 2,
         mean=np.zeros(16), spread=np.ones(16), font_signal=rng.uniform(0, 1, 16)))
@@ -356,6 +364,76 @@ def test_font_signal_tells_font_features_from_text_features():
     assert report.font_signal().tolist() == pytest.approx([1.0, 0.0])
 
 
+def test_font_separation_splits_the_variation_of_each_dimension():
+    report = ValidationReport()
+    # dimension 0 only depends on the font, dimension 1 only on the text, dimension 2 never changes
+    latent = torch.tensor([[1.0, 1.0, 2.0], [1.0, -1.0, 2.0], [-1.0, 1.0, 2.0], [-1.0, -1.0, 2.0]])
+    batch = {'text': ['ab'] * 4, 'font_index': torch.tensor([0, 0, 3, 3])}
+    report.update(batch, torch.zeros(4, 1, 2, 2), latent, torch.zeros(4, 1, 2, 2))
+
+    between, within = report.font_separation()
+    assert between.tolist() == pytest.approx([0.5, 0.0, 0.0])
+    assert within.tolist() == pytest.approx([0.0, 0.5, 0.0])
+    # the length of a vector does not matter, as for the cosine similarity
+    longer = ValidationReport()
+    longer.update(batch, torch.zeros(4, 1, 2, 2), latent * torch.tensor([[1.0], [5.0], [0.2], [3.0]]),
+                  torch.zeros(4, 1, 2, 2))
+    assert longer.font_separation()[0].tolist() == pytest.approx(between.tolist())
+
+
+def test_accuracy_by_dimensions_adds_the_most_useful_dimensions_first():
+    report = ValidationReport()
+    # four fonts at the corners of a square in dimensions 2 and 0. Dimension 1 is noise from the text.
+    corners = torch.tensor([[1.0, 0.0, 1.0], [-1.0, 0.0, 1.0], [1.0, 0.0, -1.0], [-1.0, 0.0, -1.0]])
+    font_index = torch.arange(4).repeat_interleave(2)
+    noise = torch.tensor([0.0, 0.3, 0.0]) * torch.tensor([1.0, -1.0] * 4).unsqueeze(1)
+    latent = corners[font_index] * torch.tensor([0.5, 1.0, 1.0]) + noise
+    batch = {'text': ['ab'] * 8, 'font_index': font_index}
+    report.update(batch, torch.zeros(8, 1, 2, 2), latent, torch.zeros(8, 1, 2, 2))
+
+    order, accuracy = report.accuracy_by_dimensions(TopKCosimAccuracy(corners), ks=(1, 2))
+    # dimension 2 separates the fonts most, the noise dimension comes last
+    assert order.tolist() == [2, 0, 1]
+    assert accuracy.shape == (2, 3)
+    # one dimension tells two pairs of fonts apart, and a font tied with the true one counts as better
+    assert accuracy[:, 0].tolist() == [0.0, 1.0]
+    assert accuracy[:, 1].tolist() == [1.0, 1.0]
+    assert accuracy[:, 2].tolist() == [1.0, 1.0]
+
+    # fonts without a centroid never match, and a sample of one is a miss
+    valid = torch.tensor([True, True, True, False])
+    _, accuracy = report.accuracy_by_dimensions(TopKCosimAccuracy(corners, valid), ks=(1,))
+    assert accuracy[0, -1] == pytest.approx(0.75)
+    # a limit on the samples keeps them spread over the set
+    _, accuracy = report.accuracy_by_dimensions(TopKCosimAccuracy(corners), ks=(1,), max_samples=4)
+    assert accuracy[0, -1] == 1.0
+
+
+def test_latent_comparison_marks_the_columns_of_each_font():
+    # two fonts with three texts each, and a third with a single text. Feature 0 is the same for all texts of
+    # a font, feature 1 changes with the text in font 0 only, feature 2 lies in between.
+    latent = np.array([[2.0, -1.0, 0.0], [2.0, 0.0, 0.5], [2.1, 1.0, 1.0],
+                       [-2.0, 0.1, 0.0], [-2.0, 0.0, 1.0], [-2.2, 0.2, 0.2],
+                       [0.0, 0.0, 0.0]])
+    figure = figures.plot_latent_comparison(
+        latent, [0, 0, 0, 1, 1, 1, 2], ['A'] * 3 + ['B'] * 3 + ['C'], ['x', 'y', 'z'] * 2 + ['x'],
+        mean=np.zeros(3), spread=np.ones(3), font_signal=np.ones(3))
+    draw(figure)
+
+    heatmap = figure.axes[1]
+    # each font gets a row of marks below its texts: 3 + 1, 3 + 1 and 1 + 1 rows
+    assert heatmap.images[0].get_array().shape == (10, 3)
+    marks = [collection.get_offsets().tolist() for collection in heatmap.collections]
+    # font 0: features 0 steady, 1 differing. font 1: features 0 and 1 steady, none differing. font 2: no marks
+    assert [[x for x, _ in offsets] for offsets in marks] == [[0], [1], [0, 1], []]
+    # the marks of a font lie between its last text and the first text of the next font
+    assert 2.5 < marks[0][0][1] < 3.5 and 6.5 < marks[2][0][1] < 7.5
+
+    looser = figures.plot_latent_comparison(
+        latent[:3], [0, 0, 0], ['A'] * 3, ['x', 'y', 'z'], np.zeros(3), np.ones(3), np.ones(3), steady=1.0, differing=1.0)
+    assert [[x for x, _ in c.get_offsets().tolist()] for c in looser.axes[1].collections] == [[0, 2], [1, 2]]
+
+
 def test_display_text_leaves_shaping_to_a_matplotlib_that_can_do_it(monkeypatch):
     word = 'گونه'
     # reshaping a second time would reverse the word again and break its joins
@@ -368,3 +446,26 @@ def test_display_text_leaves_shaping_to_a_matplotlib_that_can_do_it(monkeypatch)
     assert shaped != word and len(shaped) == len(word)
     assert all(0xFB50 <= ord(char) <= 0xFEFF for char in shaped)
     assert figures.display_text('abc') == 'abc'
+
+
+def test_multiscale_loss_pays_for_drawing_a_stroke_slightly_off():
+    import torch.nn.functional as F
+
+    target = -torch.ones(1, 1, 16, 16)
+    target[:, :, :, 6] = 1.0          # a thin vertical stroke
+    shifted = -torch.ones(1, 1, 16, 16)
+    shifted[:, :, :, 7] = 1.0         # the same stroke, one pixel off
+    blank = -torch.ones(1, 1, 16, 16)
+
+    # pixel by pixel, the misplaced stroke costs twice as much as drawing nothing
+    assert F.l1_loss(shifted, target) == pytest.approx(2 * F.l1_loss(blank, target).item())
+    # over several scales it costs less than drawing nothing
+    assert multiscale_l1_loss(shifted, target) < multiscale_l1_loss(blank, target)
+    assert multiscale_l1_loss(target, target).item() == 0.0
+
+    # it is the mean of the errors at each scale, and leaves out scales larger than the image
+    expected = torch.stack([F.l1_loss(F.avg_pool2d(blank, scale), F.avg_pool2d(target, scale)) if scale > 1
+                            else F.l1_loss(blank, target) for scale in (1, 2, 4, 8)]).mean()
+    assert multiscale_l1_loss(blank, target) == pytest.approx(expected.item())
+    small = torch.zeros(1, 1, 4, 4)
+    assert multiscale_l1_loss(small + 1, small) == pytest.approx(1.0)

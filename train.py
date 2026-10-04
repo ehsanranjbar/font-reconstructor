@@ -6,11 +6,12 @@ import torch
 from font_reconstructor import factory
 from font_reconstructor.config import ConfigParser
 from font_reconstructor.trainer import Trainer
-from font_reconstructor.utils import prepare_device, seed_everything
+from font_reconstructor.utils import prepare_device, raise_open_file_limit, seed_everything
 
 
 def main(config):
     logger = config.get_logger('train')
+    raise_open_file_limit()
 
     # fix random seeds for reproducibility
     seed_everything(config.get('seed', 42))
@@ -61,7 +62,8 @@ def main(config):
                       contrastive_criterion=contrastive_criterion,
                       contrastive_weight=contrastive_weight,
                       **factory.build_adversarial(config, fonts, device),
-                      **factory.build_style_head(config))
+                      **factory.build_style_head(config),
+                      **factory.build_reconstruction(config))
 
     trainer.train()
 
@@ -79,7 +81,10 @@ if __name__ == '__main__':
     CustomArgs = collections.namedtuple('CustomArgs', 'flags type target')
     options = [
         CustomArgs(['--lr', '--learning_rate'], type=float, target='optimizer;args;lr'),
-        CustomArgs(['--bs', '--batch_size'], type=int, target='data_loader;args;batch_size')
+        CustomArgs(['--bs', '--batch_size'], type=int, target='data_loader;args;batch_size'),
+        # which glyphs the reconstruction is trained on: 'all' of the fingerprint or those of the 'text'
+        CustomArgs(['--glyphs'], type=str, target='reconstruction;glyphs'),
+        CustomArgs(['--decoder', '--decoder_type'], type=str, target='arch;args;decoder_type'),
     ]
     config = ConfigParser.from_args(args, options)
     main(config)

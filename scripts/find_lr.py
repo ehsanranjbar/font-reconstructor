@@ -36,7 +36,8 @@ from font_reconstructor import factory  # noqa: E402
 from font_reconstructor.config import ConfigParser  # noqa: E402
 from font_reconstructor.logger import figures  # noqa: E402
 from font_reconstructor.trainer import Trainer  # noqa: E402
-from font_reconstructor.utils import prepare_device, read_json, seed_everything  # noqa: E402
+from font_reconstructor.utils import (  # noqa: E402
+    prepare_device, raise_open_file_limit, read_json, seed_everything)
 
 
 def smooth(values, beta=0.9):
@@ -67,6 +68,7 @@ def range_test(config, steps, min_lr, max_lr, stop_factor=4.0):
     :return: (rates, losses) of the steps that were run. losses is a dict of name to list.
     """
     seed_everything(config.get('seed', 42))
+    raise_open_file_limit()
     device, _ = prepare_device(config['n_gpu'], config.get('device', 'auto'))
     print(f"Using device: {device}")
 
@@ -80,7 +82,8 @@ def range_test(config, steps, min_lr, max_lr, stop_factor=4.0):
     # the trainer is only used for its loss, with everything of the config that goes into it
     trainer = Trainer(model, factory.build_criterion(config), [], optimizer, config=config, device=device,
                       data_loader=data_loader, contrastive_criterion=contrastive_criterion,
-                      contrastive_weight=contrastive_weight, **factory.build_style_head(config))
+                      contrastive_weight=contrastive_weight, **factory.build_style_head(config),
+                      **factory.build_reconstruction(config))
 
     rates = min_lr * (max_lr / min_lr) ** (np.arange(steps) / max(steps - 1, 1))
     losses, best, batches = {}, float('inf'), iter(data_loader)

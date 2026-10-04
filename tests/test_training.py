@@ -107,6 +107,29 @@ def test_train_with_tensorboard(fonts_dir, tmp_path):
     assert {'mrr/val', 'recon_skill/val', 'style_acc/val', 'style_acc/train', 'loss/val'} <= set(tags['scalars'])
     assert [event.step for event in events.Scalars('mrr/val')] == [1, 2]
 
+    # the same figures as files: every written epoch under the name of the figure, and the newest under latest
+    figure_dir = log_dir / 'figures'
+    assert sorted(path.name for path in (figure_dir / 'samples').iterdir()) == ['epoch_002.png']
+    assert (figure_dir / 'latest' / 'samples.png').read_bytes() == (figure_dir / 'samples' / 'epoch_002.png').read_bytes()
+    assert (figure_dir / 'latest' / 'identification_by_rank.png').exists()
+    assert len(list((figure_dir / 'latest').iterdir())) == len(tags['images'])
+
+
+def test_figures_are_saved_without_tensorboard(fonts_dir, tmp_path):
+    train = load_script('train')
+    config = make_config(fonts_dir, tmp_path, epochs=2)
+    train.main(ConfigParser(copy.deepcopy(config), run_id='files'))
+    figure_dir = tmp_path / 'saved' / 'log' / 'smoke' / 'files' / 'figures'
+    assert sorted(path.name for path in (figure_dir / 'samples').iterdir()) == ['epoch_001.png', 'epoch_002.png']
+    # twice the resolution of the layout, which is 100 dots per inch
+    from PIL import Image
+    with Image.open(figure_dir / 'latest' / 'latent_space.png') as image:
+        assert image.size == (2200, 1680)
+
+    config['trainer']['save_figures'] = False
+    train.main(ConfigParser(copy.deepcopy(config), run_id='no_files'))
+    assert not (tmp_path / 'saved' / 'log' / 'smoke' / 'no_files' / 'figures').exists()
+
 
 def test_train_with_conditioned_decoder_and_adversarial_loss(fonts_dir, tmp_path):
     train = load_script('train')
@@ -127,6 +150,80 @@ def test_train_with_conditioned_decoder_and_adversarial_loss(fonts_dir, tmp_path
     resumed['trainer']['epochs'] = 3
     train.main(ConfigParser(resumed, resume=checkpoint_path, run_id='adversarial_resumed'))
     assert (run_dir(tmp_path, 'adversarial_resumed') / 'checkpoint-epoch3.pth').exists()
+
+
+def test_pick_glyphs_takes_them_from_the_text():
+    from font_reconstructor.trainer.trainer import pick_glyphs
+
+    seen = torch.tensor([[1, 0, 1, 1, 0, 0], [0, 0, 0, 0, 1, 0], [0, 0, 0, 0, 0, 0], [1, 1, 1, 1, 1, 1]], dtype=torch.bool)
+    picks = [pick_glyphs(seen, 4) for _ in range(20)]
+    for picked in picks:
+        assert picked.shape == (4, 4)
+        # fewer glyphs than asked for: all of them, and one of them twice
+        assert sorted(set(picked[0].tolist())) == [0, 2, 3]
+        assert picked[1].tolist() == [4, 4, 4, 4]
+        # no glyph in the text: any single one, so that the shape stays the same
+        assert len(set(picked[2].tolist())) == 1
+        # more glyphs than asked for: different ones
+        assert len(set(picked[3].tolist())) == 4
+    # and not always the same ones
+    assert len({tuple(picked[3].tolist()) for picked in picks}) > 1
+
+
+def test_train_on_the_glyphs_of_the_text(fonts_dir, tmp_path):
+    from font_reconstructor import factory
+    from font_reconstructor.trainer import Trainer
+
+    train = load_script('train')
+    config = make_config(fonts_dir, tmp_path, epochs=1)
+    config['arch']['args'].update({'decoder_type': 'conditioned', 'decoder_channels': 8})
+    config['reconstruction'] = {'glyphs': 'text', 'glyphs_per_sample': 3}
+    train.main(ConfigParser(copy.deepcopy(config), run_id='text_glyphs'))
+    assert (run_dir(tmp_path, 'text_glyphs') / 'checkpoint-epoch1.pth').exists()
+
+    # the trainer draws and compares three glyphs of each sample, validation the whole fingerprint
+    parsed = ConfigParser(copy.deepcopy(config), run_id='text_glyphs_losses')
+    fonts = factory.build_fontset(parsed)
+    loader, valid_loader = factory.build_train_valid_loaders(parsed, fonts, 'cpu')
+    model = factory.build_model(parsed, fonts)
+    trainer = Trainer(model, factory.build_criterion(parsed), [], torch.optim.Adam(model.parameters()), config=parsed,
+                      device='cpu', data_loader=loader, **factory.build_reconstruction(parsed))
+    batch = next(iter(loader))
+    losses, output, target = trainer.compute_losses(batch)
+    assert output.shape == target.shape == (8, 3, 32, 32)
+    assert torch.isfinite(losses['total_loss'])
+    assert model(batch['image']).shape == (8, fonts.num_glyphs, 32, 32)
+
+    # the same setting works with the joint decoder, which picks the glyphs from the whole fingerprint
+    config['arch']['args']['decoder_type'] = 'joint'
+    train.main(ConfigParser(copy.deepcopy(config), run_id='text_glyphs_joint'))
+
+    # a discriminator needs whole fingerprints
+    config['adversarial_loss'] = {'weight': 0.05, 'discriminator_channels': 8}
+    with pytest.raises(ValueError, match='target_glyphs'):
+        train.main(ConfigParser(copy.deepcopy(config), run_id='text_glyphs_adversarial'))
+    config['reconstruction'] = {'glyphs': 'some'}
+    del config['adversarial_loss']
+    with pytest.raises(ValueError, match='target_glyphs'):
+        train.main(ConfigParser(copy.deepcopy(config), run_id='text_glyphs_unknown'))
+
+
+def test_command_line_options_reach_blocks_the_config_leaves_out(fonts_dir, tmp_path):
+    from font_reconstructor import factory
+
+    config = make_config(fonts_dir, tmp_path)
+    assert 'reconstruction' not in config and factory.build_reconstruction(config) == {}
+    options = {'reconstruction;glyphs': 'text', 'arch;args;decoder_type': 'conditioned', 'optimizer;args;lr': None}
+    parsed = ConfigParser(copy.deepcopy(config), modification=options, run_id='options')
+    assert factory.build_reconstruction(parsed) == {'target_glyphs': 'text'}
+    assert parsed['arch']['args']['decoder_type'] == 'conditioned'
+    # an option that is not given leaves the config as it is
+    assert parsed['optimizer']['args']['lr'] == 0.001
+
+    # a block that is there keeps its other settings
+    config['reconstruction'] = {'glyphs': 'text', 'glyphs_per_sample': 3}
+    parsed = ConfigParser(copy.deepcopy(config), modification={'reconstruction;glyphs': 'all'}, run_id='options_all')
+    assert factory.build_reconstruction(parsed) == {'target_glyphs': 'all', 'glyphs_per_sample': 3}
 
 
 def test_train_with_style_head(fonts_dir, tmp_path):
@@ -228,6 +325,26 @@ def test_lr_range_test_readings():
     marks = find_lr.read_marks(rates, loss)
     assert marks['steepest'] == pytest.approx(1e-3, rel=0.3)
     assert marks['minimum'] == pytest.approx(1e-2, rel=0.3)
+
+
+def test_train_with_synthetic_variants_and_multiscale_loss(fonts_dir, tmp_path):
+    train = load_script('train')
+    test = load_script('test')
+    config = make_config(fonts_dir, tmp_path, epochs=1)
+    config['dataset']['synthetic_variants'] = {'outline': 3, 'italic': 3}
+    config['dataset']['render_scale'] = 1
+    config['loss'] = 'multiscale_l1_loss'
+    config['style_head'] = {'weight': 0.2}
+    config['data_loader']['args']['total_samples'] = 144
+
+    train.main(ConfigParser(copy.deepcopy(config), run_id='variants'))
+    checkpoint_path = run_dir(tmp_path, 'variants') / 'checkpoint-epoch1.pth'
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
+    # regular, outline and italic
+    assert checkpoint['state_dict']['style_head.weight'].shape[0] == 3
+
+    log = test.main(ConfigParser(copy.deepcopy(config), resume=checkpoint_path, run_id='variants_test'))
+    assert log['loss'] > 0 and 'style_acc' in log
 
 
 def test_train_without_validation(fonts_dir, tmp_path):

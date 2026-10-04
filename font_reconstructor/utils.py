@@ -41,6 +41,28 @@ def seed_everything(seed):
     torch.backends.cudnn.benchmark = False
 
 
+def raise_open_file_limit(minimum=4096):
+    """
+    Allow this process at least `minimum` open files. Data loader workers inherit the limit.
+
+    Every worker holds pipes to the main process, and three loaders with a dozen workers each need more than
+    the 256 open files that macOS allows a shell by default.
+    """
+    try:
+        import resource
+    except ImportError:  # not available on Windows, which has no such limit
+        return
+
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    target = minimum if hard == resource.RLIM_INFINITY else min(minimum, hard)
+    if soft == resource.RLIM_INFINITY or soft >= target:
+        return
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+    except (ValueError, OSError) as error:
+        _logger.warning("Could not raise the limit of open files from %d to %d: %s", soft, target, error)
+
+
 def mps_is_available():
     mps = getattr(torch.backends, 'mps', None)
     return mps is not None and mps.is_available()

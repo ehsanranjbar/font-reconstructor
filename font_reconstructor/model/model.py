@@ -15,15 +15,26 @@ class BaseModel(nn.Module):
     def decode(self, latent):
         raise NotImplementedError
 
-    def forward(self, x, return_latent=False):
+    def decode_glyphs(self, latent, glyph_index):
+        """
+        Draw only some glyphs of each fingerprint.
+
+        :param glyph_index: tensor (batch, k) of the glyphs to draw for each latent vector
+        :return: tensor (batch, k, height, width)
+        """
+        return select_glyphs(self.decode(latent), glyph_index)
+
+    def forward(self, x, return_latent=False, glyphs=None):
         """
         Forward pass logic
 
         :param return_latent: also return the latent vector, which losses on the embedding need
+        :param glyphs: tensor (batch, k) of glyph indices. If given, only these glyphs of each fingerprint are
+            drawn, see `decode_glyphs`.
         :return: the reconstructed fingerprint, or (fingerprint, latent) with `return_latent`
         """
         latent = self.encode(x)
-        output = self.decode(latent)
+        output = self.decode(latent) if glyphs is None else self.decode_glyphs(latent, glyphs)
         return (output, latent) if return_latent else output
 
     def __str__(self):
@@ -32,6 +43,16 @@ class BaseModel(nn.Module):
         """
         params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         return super().__str__() + '\nTrainable parameters: {}'.format(params)
+
+
+def select_glyphs(fingerprint, glyph_index):
+    """
+    :param fingerprint: tensor (batch, glyphs, height, width)
+    :param glyph_index: tensor (batch, k) of glyphs to pick from each fingerprint
+    :return: tensor (batch, k, height, width)
+    """
+    index = glyph_index[:, :, None, None].expand(-1, -1, *fingerprint.shape[2:])
+    return fingerprint.gather(1, index)
 
 
 class ResidualBlock(nn.Module):
@@ -119,6 +140,9 @@ class CompactAutoEncoder(BaseModel):
     """
 
     _UPSAMPLINGS = 4
+    # glyphs the conditioned decoder draws in one pass. Drawing all glyphs of a large batch at once would hold
+    # every one of them in memory at full resolution.
+    _GLYPHS_PER_PASS = 4096
 
     def __init__(
             self,
@@ -211,8 +235,35 @@ class CompactAutoEncoder(BaseModel):
         styles = latent.unsqueeze(1).expand(batch_size, glyphs, -1)
         characters = self.glyph_embedding.weight.unsqueeze(0).expand(batch_size, glyphs, -1)
         conditions = torch.cat([styles, characters], dim=2).reshape(batch_size * glyphs, -1)
-        images = self.decoder(self.from_latent(conditions))
-        return images.reshape(batch_size, glyphs, *self.output_dims)
+        return self._draw(conditions).reshape(batch_size, glyphs, *self.output_dims)
+
+    def decode_glyphs(self, latent, glyph_index):
+        """
+        Draw only some glyphs of each fingerprint.
+
+        The conditioned decoder runs for these glyphs only, which is what makes training on a few glyphs of
+        each sample affordable. The joint decoder draws all glyphs anyway, they are picked from its output.
+
+        :param glyph_index: tensor (batch, k) of the glyphs to draw for each latent vector
+        :return: tensor (batch, k, height, width)
+        """
+        if self.decoder_type == 'joint':
+            return super().decode_glyphs(latent, glyph_index)
+        batch_size, glyphs = glyph_index.shape
+        styles = latent.unsqueeze(1).expand(batch_size, glyphs, -1)
+        conditions = torch.cat([styles, self.glyph_embedding(glyph_index)], dim=2).reshape(batch_size * glyphs, -1)
+        return self._draw(conditions).reshape(batch_size, glyphs, *self.output_dims)
+
+    def _draw(self, conditions):
+        """
+        the conditioned decoder on rows of (latent vector, character embedding)
+
+        :return: tensor (rows, height, width)
+        """
+        images = [self.decoder(self.from_latent(chunk)) for chunk in conditions.split(self._GLYPHS_PER_PASS)]
+        if not images:
+            return conditions.new_zeros(0, *self.output_dims)
+        return torch.cat(images).squeeze(1)
 
 
 class GlyphDiscriminator(nn.Module):

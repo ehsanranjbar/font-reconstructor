@@ -25,6 +25,8 @@ class RandomTextImageDataset(Dataset):
         image:      uint8 array of the text rendered white on black. It is `render_scale` times the size of
                     `text_image_dims` with a border around the text, see TextImageTransform for the next step.
         target:     uint8 array (height, width, glyphs), the fingerprint of the font. Only if `return_target`.
+        seen:       bool array (glyphs,), True for the glyphs of the fingerprint that occur in the text. Only if
+                    `return_target`.
         text:       the rendered text
         font:       name of the font
         font_index: position of the font in `fonts`
@@ -131,6 +133,7 @@ class RandomTextImageDataset(Dataset):
             self.fonts.glyphs(font_index),
             self.font_fingerprint_dims,
             self.fonts.num_glyphs,
+            variant=self.fonts.variants[font_index],
         )
 
     def font_fingerprint(self, font_index):
@@ -142,7 +145,8 @@ class RandomTextImageDataset(Dataset):
         return self.generate_font_fingerprint(font_index)
 
     def generate_text_image(self, font_index, text):
-        return render_text(self.fonts.ttf(font_index), text, self.render_dims, fill=RENDER_FILL)
+        return render_text(self.fonts.ttf(font_index), text, self.render_dims, fill=RENDER_FILL,
+                           variant=self.fonts.variants[font_index])
 
     def _sample_spec(self, idx):
         """
@@ -201,8 +205,19 @@ class RandomTextImageDataset(Dataset):
 
         if self.return_target:
             sample['target'] = self.font_fingerprint(font_index)
+            sample['seen'] = self.seen_glyphs(font_index, text)
 
         return sample
+
+    def seen_glyphs(self, font_index, text):
+        """
+        :return: bool array (glyphs,), True for the glyphs of the font's fingerprint that occur in `text`
+        """
+        characters = set(text)
+        seen = np.zeros(self.fonts.num_glyphs, dtype=bool)
+        for position, glyph in enumerate(self.fonts.glyphs(font_index)):
+            seen[position] = glyph != "\0" and glyph in characters
+        return seen
 
 
 class TransformedSubset(Dataset):

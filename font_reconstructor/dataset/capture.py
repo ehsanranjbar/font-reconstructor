@@ -104,8 +104,9 @@ class CaptureSimulation:
     :param jpeg_quality: range of the compression quality
     :param margin: range of the margin around the text on each side, as a fraction of the text height. With
         a negative lower end, crops can cut into the text, which loses the dots and tails of letters.
-    :param min_ink, max_ink: a result has to keep between `min_ink` and `max_ink` times the bright area of
-        the clean rendering. Otherwise the text was lost or drowned in noise, and the simulation is run again.
+    :param min_agreement: lowest agreement of a result with the clean text it was made from, see
+        `text_agreement`. Below it the text was lost, broken up or drowned in noise, and the simulation is run
+        again: such an image tells little about the font, and nobody would use it to identify one.
     :param max_tries: number of runs before the clean rendering is returned instead
     """
 
@@ -124,9 +125,8 @@ class CaptureSimulation:
         jpeg_prob: float = 0.5,
         jpeg_quality: Tuple[int, int] = (25, 90),
         margin: Tuple[float, float] = (0.0, 0.25),
-        min_ink: float = 0.35,
-        max_ink: float = 3.0,
-        max_tries: int = 3,
+        min_agreement: float = 0.9,
+        max_tries: int = 4,
     ):
         self.dims = tuple(dims)
         self.binarize_prob = binarize_prob
@@ -141,8 +141,7 @@ class CaptureSimulation:
         self.jpeg_prob = jpeg_prob
         self.jpeg_quality = tuple(jpeg_quality)
         self.margin = tuple(margin)
-        self.min_ink = min_ink
-        self.max_ink = max_ink
+        self.min_agreement = min_agreement
         self.max_tries = max_tries
 
     def __call__(self, image: np.ndarray, rng: np.random.Generator) -> np.ndarray:
@@ -151,31 +150,21 @@ class CaptureSimulation:
         :param rng: the only source of randomness
         :return: uint8 array shaped (height, width) of `dims`, white text on black
         """
-        clean = clean_text_image(image, self.dims)
-        clean_ink = float((clean > 127).mean())
         for _ in range(self.max_tries):
-            text = Image.fromarray(image)
-            text = self._distort(text, rng)
-            text = self._print_and_focus(text, rng)
-            photo = self._photograph(text, rng)
+            text = self._distort(Image.fromarray(image), rng)
+            photo = self._photograph(self._print_and_focus(text, rng), rng)
             cleaned = self._clean_up(photo, rng)
+            # the distorted text is what a perfect capture would have given, pixel for pixel
+            if text_agreement(text, cleaned) < self.min_agreement:
+                continue
 
             margins = tuple(rng.uniform(*self.margin, size=4))
             align = (rng.uniform(0.0, 1.0), rng.uniform(0.3, 0.7))
-            result = np.asarray(fit_to_box(cleaned, self.dims, margins, align))
-            if self._shows_text(result, clean_ink):
-                return result
+            return np.asarray(fit_to_box(cleaned, self.dims, margins, align))
 
         # every try destroyed the text, as a hard threshold does to hairline strokes. An image without its text
         # teaches nothing about the font, so the clean rendering stands in.
-        return clean
-
-    def _shows_text(self, result: np.ndarray, clean_ink: float) -> bool:
-        """
-        whether a result still shows its text: its amount of ink is in the range of the clean rendering's
-        """
-        ink = float((result > 127).mean())
-        return self.min_ink * clean_ink <= ink <= max(self.max_ink * clean_ink, 0.05)
+        return clean_text_image(image, self.dims)
 
     def _distort(self, text: Image.Image, rng) -> Image.Image:
         """
@@ -196,7 +185,11 @@ class CaptureSimulation:
         ink spread or loss, lens blur and camera motion
         """
         if rng.random() < self.stroke_change_prob:
-            text = text.filter(ImageFilter.MaxFilter(3) if rng.random() < 0.5 else ImageFilter.MinFilter(3))
+            # Ink that spreads or fades moves every edge by a pixel. On hairlines that is no slight change: they
+            # would vanish, or close up the inside of an outlined letter. Strokes that thin are left as they are.
+            changed = text.filter(ImageFilter.MaxFilter(3) if rng.random() < 0.5 else ImageFilter.MinFilter(3))
+            if 0.6 <= _ink_amount(changed) / max(_ink_amount(text), 1.0) <= 1.6:
+                text = changed
         text = text.filter(ImageFilter.GaussianBlur(rng.uniform(*self.blur)))
         if rng.random() < self.motion_blur_prob:
             text = text.filter(_motion_kernel(rng))
@@ -217,6 +210,9 @@ class CaptureSimulation:
         y = np.linspace(-0.5, 0.5, height, dtype=np.float32)[:, None]
         slope_x, slope_y = rng.uniform(-self.lighting, self.lighting, size=2)
         scene = scene * (1.0 + slope_x * x + slope_y * y)
+        # the exposure is set for the brightest paper. Blown out paper would no longer follow the lighting,
+        # and the cleanup would take the difference for ink.
+        scene = scene / max(1.0, float(scene.max()))
 
         scene = scene + rng.normal(0.0, rng.uniform(*self.noise), size=scene.shape).astype(np.float32)
         photo = Image.fromarray((np.clip(scene, 0.0, 1.0) * 255).astype(np.uint8))
@@ -260,6 +256,29 @@ class CaptureSimulation:
             ink = ink ** rng.uniform(0.6, 1.7)
 
         return Image.fromarray((ink * 255).astype(np.uint8))
+
+
+def text_agreement(text: Image.Image, captured: Image.Image) -> float:
+    """
+    How well a captured image still shows its text: the correlation of the two images, from -1 to 1.
+
+    Both show the same view, so they are compared pixel by pixel after a slight smoothing. Thicker or thinner
+    strokes, soft edges and some noise keep the agreement above 0.9. It falls when strokes break up or go
+    missing, and towards 0 when noise or a misjudged background covers the image.
+
+    :param text: the clean text, white on black
+    :param captured: the image after capture and cleanup, of any size
+    """
+    reference = text if text.size == captured.size else text.resize(captured.size, Image.BILINEAR)
+    a = np.asarray(reference.filter(ImageFilter.BoxBlur(1)), dtype=np.float32)
+    b = np.asarray(captured.filter(ImageFilter.BoxBlur(1)), dtype=np.float32)
+    a, b = a - a.mean(), b - b.mean()
+    scale = float(np.sqrt((a * a).sum() * (b * b).sum()))
+    return float((a * b).sum() / scale) if scale > 0 else 0.0
+
+
+def _ink_amount(image: Image.Image) -> float:
+    return float(np.asarray(image, dtype=np.float32).sum())
 
 
 def _quantiles(values: np.ndarray, quantiles: Sequence[float]) -> np.ndarray:

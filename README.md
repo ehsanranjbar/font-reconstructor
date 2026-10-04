@@ -90,6 +90,27 @@ for the worst glyph). Weights and styles of a typeface are kept. The dry run wri
 thresholds. `--apply` keeps backups of the csv files. Changing the font list invalidates the caches
 and the font numbering of earlier runs, so apply it before a training run, not during one.
 
+### Synthetic fonts
+
+Collections have many regular fonts and few outlined or slanted ones. `synthetic_variants` in the `dataset`
+block fills those styles up: it takes a number of extra fonts per style, and each is a real font drawn
+outlined, slanted or heavier. A variant is a font of its own, with its own text images, fingerprint and
+style label.
+
+```json
+"synthetic_variants": {"outline": 200, "italic": 120, "bold italic": 100}
+```
+
+| style | drawn as | made from |
+|-------|----------|-----------|
+| `outline` | hollow, with a line around the glyphs | regular, bold and light fonts |
+| `italic` | slanted, top leaning left as Persian slanted styles do | regular fonts |
+| `bold italic` | slanted | bold fonts |
+| `bold` | with a heavier stroke | regular fonts |
+
+Variants are in the family of their font, so the variants of a held out font are not trained on.
+Validation uses real fonts only. All fonts, real and synthetic, are among those a font is identified from.
+
 ### Text corpus
 
 Texts are drawn from the files listed under `corpus_files`. Each line of a file is a phrase, or a
@@ -127,8 +148,14 @@ that history (`CaptureSimulation` in `font_reconstructor/dataset/capture.py`):
 5. a crop to the text with a random margin and resizing to the model input. The crop never cuts into the
    text by default, because the dots and tails of letters at the edge tell fonts apart.
 
-A result that lost its text, as a hard threshold does to hairline strokes, is not used: the simulation
-runs again, and after three such results the clean rendering is used instead.
+Every result is compared with the clean text it was made from. If the text was lost, broken up or drowned
+in noise, the simulation runs again, and after four such results the clean rendering is used instead. An
+image like that tells little about the font, and nobody would use it to identify one. `min_agreement` sets
+how much damage is accepted: it is the lowest correlation with the clean text, 0.9 by default.
+
+The simulation also avoids damage that a real capture does not do. The photo is exposed for its brightest
+paper, so paper is never blown out and taken for ink, and strokes are only thickened or thinned by a pixel
+where that does not wipe out hairlines or close up outlined letters.
 
 Steps 2 and 4 make strokes thicker or thinner, which is what a real threshold does. Texts are rendered
 at `render_scale` times the model input, so these changes are finer than one pixel of the input.
@@ -188,8 +215,22 @@ test again after changing the batch size or the loss weights, they move the usab
 
 - **Held out fonts.** `validation_split` holds out whole font families. Validation and `test.py`
   only use those fonts. Each of them is identified among all fonts, the training fonts included.
-- **Loss.** The reconstruction loss (`loss`, L1 by default) plus `contrastive_loss.weight` times a
-  supervised contrastive loss on the latent vector.
+- **Loss.** The reconstruction loss (`loss`) plus `contrastive_loss.weight` times a supervised
+  contrastive loss on the latent vector. The default reconstruction loss is `multiscale_l1_loss`: the
+  mean absolute error of the fingerprint and of its averages over blocks of 2, 4 and 8 pixels. With a
+  plain pixel loss (`l1_loss`), a thin stroke drawn one pixel off costs twice as much as drawing
+  nothing, which taught the model to leave outline fonts blank. `val_recon_skill` is always measured
+  with the plain pixel error, so it stays comparable between losses.
+- **Glyphs of the text only, optional.** With a `reconstruction` block of `{"glyphs": "text", "glyphs_per_sample": 8}` the
+  reconstruction is trained on glyphs that occur in the text of each image instead of the whole fingerprint:
+  eight of them per image, picked at random, some twice if the text shows fewer. The model is then not asked to
+  guess glyphs it has not seen. It also makes the conditioned decoder affordable, which only draws those
+  glyphs. Validation still draws the whole fingerprint, so `val_loss` stays comparable between runs, and
+  `val_seen_glyph_loss` and `val_unseen_glyph_loss` show how the glyphs it was not trained to draw come out.
+  The training `loss` covers the picked glyphs only. It does not work together with the adversarial term.
+  Set `glyphs` to `"all"` to train on the whole fingerprint again. Both settings can also be given on the
+  command line, which overrides the config: `python train.py -c config.json --glyphs all`, and
+  `--decoder joint` or `--decoder conditioned` for the kind of decoder.
 - **Batches.** The contrastive loss needs several images of a font in one batch. Training batches
   hold `batch_fonts` fonts with `batch_samples_per_font` images each.
 - **Style head.** With a `style_head` block, a single linear layer on the latent vector predicts the
@@ -215,7 +256,25 @@ Besides the losses and accuracies, every validation logs these scalars:
 | `val_recon_skill` | share of the baseline's reconstruction error that the model removes. The baseline is the median fingerprint of the training fonts, the best answer without looking at the input. 0 is no better than that, 1 is perfect. |
 | `val_seen_glyph_loss`, `val_unseen_glyph_loss` | reconstruction error of the glyphs that occur in the input text, and of those the model had to infer |
 
-With tensorboard enabled it also writes these figures, every `figure_period` epochs:
+It also draws the figures below, every `figure_period` epochs. They go to tensorboard, and as image
+files to the run's log directory, which is the easier place to look at them:
+
+```text
+saved/log/<name>/<run>/figures/
+  latest/                 the newest version of every figure, the files to keep open
+    samples.png
+    worst_cases.png
+    ...
+  samples/                every epoch of one figure side by side
+    epoch_001.png
+    epoch_002.png
+  worst_cases/
+    ...
+```
+
+The files are written at `figure_dpi` dots per inch (200 by default), twice the resolution shown in
+tensorboard, so they stay sharp when zoomed. Set `save_figures` to false to write none.
+
 
 | tag | shows |
 |-----|-------|
@@ -225,8 +284,8 @@ With tensorboard enabled it also writes these figures, every `figure_period` epo
 | `identification/by_rank` | share of samples whose true font is within the k best matches, for every k |
 | `identification/by_style`, `identification/by_text_length` | top-1 accuracy by the style of the font and by the length of the text |
 | `style_predictions` | which styles the style head answers for each true style |
-| `latent_space` | the spread of each latent dimension and the lengths of the latent vectors |
-| `latent_comparison` | the latent vectors of the panel fonts side by side, three texts of each. Every latent feature is a column, coloured by how far it lies above or below the validation average. A column that keeps its colour within a font and changes between fonts tells fonts apart; one that changes within a font reacts to the text. Bars above give each feature's share of variation that lies between fonts, and a matrix beside it gives the cosine similarity of every pair of rows. |
+| `latent_space` | what each latent dimension contributes: its share of all variation, split into the part between fonts, which tells them apart, and the part inside a font, which follows the text. Below it, the top-1 and top-5 accuracy with only the n most useful dimensions, which shows how many dimensions the model needs, and the lengths of the latent vectors. |
+| `latent_comparison` | the latent vectors of the panel fonts side by side, three texts of each. Every latent feature is a column, coloured by how far it lies above or below the validation average. A column that keeps its colour within a font and changes between fonts tells fonts apart; one that changes within a font reacts to the text. Below the rows of each font, a dot marks the features whose values lie within half a spread of each other over its texts, which describe the font, and a cross marks those that lie one and a half spreads or more apart, which follow the text. The counts of both stand beside the font. Bars above give each feature's share of variation that lies between fonts, and a matrix beside it gives the cosine similarity of every pair of rows. |
 
 The embedding projector gets the font, its family and its style as metadata, so the points can be
 coloured by any of them.
@@ -252,19 +311,23 @@ separately:
 
 | argument | part | effect |
 |----------|------|--------|
-| `base_channels`, `latent_dim` | encoder | size and speed of the model in use. 79 thousand parameters at the defaults of 8 and 32. |
+| `base_channels`, `latent_dim` | encoder | size and speed of the model in use. 79 thousand parameters at the defaults of 8 and 32, 312 thousand at the 16 and 32 of `config.json`. |
 | `decoder_channels`, `decoder_blocks` | decoder | training cost only. `decoder_blocks` is the number of convolution blocks at each resolution. |
 | `decoder_type` | decoder | `"joint"` draws all glyphs at once, one output channel per glyph. `"conditioned"` draws one glyph at a time from the latent vector and a learned character embedding, sharing its weights between all glyphs. It runs once per glyph and trains several times slower. |
 
 | decoder | arguments | decoder parameters | training speed |
 |---------|-----------|--------------------|----------------|
 | joint, as small as the encoder | none | 42 thousand | fastest |
-| joint, wide (default of `config.json`) | `decoder_channels` 32, `decoder_blocks` 2 | 1.0 million | about half as fast |
+| joint, wide | `decoder_channels` 32, `decoder_blocks` 2 | 1.0 million | about half as fast |
 | conditioned | `decoder_type` "conditioned", `decoder_channels` 16 | 137 thousand | about 15 times slower |
+| conditioned, on glyphs of the text | the same with `reconstruction.glyphs` "text" | the same | about twice as slow as the joint decoder at a width of 8 |
 
 In a short comparison of 3,000 training steps each, the wide joint decoder reconstructed held out fonts
 best and identified them best. The conditioned decoder and the adversarial term did not pay for their
 cost in that budget. They are options for longer experiments, not defaults.
+
+The table is for fingerprints of 32 by 32 pixels. `config.json` draws them at 64 by 64 with a conditioned decoder of
+`decoder_channels` 8, which has 79 thousand parameters, trained on eight glyphs of each text.
 
 With a `style_head` block the model also gets a linear layer on the latent vector that predicts the
 style of the font, see the training section.
@@ -298,7 +361,7 @@ devices. If an operation is not implemented for MPS in your PyTorch version, run
 | `contrastive_loss` | `weight` and `temperature` of the contrastive loss. Remove the block to train on reconstruction only. |
 | `style_head` | `weight` of the style loss (0 turns the head off) and `detach` |
 | `adversarial_loss` | `weight` of the adversarial term (0 turns it off), `start_epoch`, and `lr` and `discriminator_channels` of the discriminator |
-| `trainer` | epochs, checkpointing (`save_period`, `keep_last_checkpoints`), monitoring, early stopping, `topk` values, tensorboard, `figure_period` |
+| `trainer` | epochs, checkpointing (`save_period`, `keep_last_checkpoints`), monitoring, early stopping, `topk` values, tensorboard, `figure_period`, `save_figures`, `figure_dpi` |
 
 Random augmentations only apply to the training data.
 

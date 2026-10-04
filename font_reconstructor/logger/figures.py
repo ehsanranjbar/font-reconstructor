@@ -4,13 +4,16 @@ for magnitudes, blue and orange where two series are compared, and green and red
 
 Every function takes plain arrays and returns a matplotlib figure. Nothing here knows about models or loaders.
 """
+from pathlib import Path
 from typing import List, Optional, Sequence
 
 import arabic_reshaper
 import matplotlib
+import matplotlib.ticker
 import numpy as np
 from bidi.algorithm import get_display
 from matplotlib import ft2font
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.figure import Figure
 
@@ -69,6 +72,20 @@ def display_text(text: str) -> str:
     if MATPLOTLIB_SHAPES_TEXT:
         return str(text)
     return get_display(arabic_reshaper.reshape(str(text)))
+
+
+def save_figure(figure: Figure, path, dpi: int = 200):
+    """
+    Write a figure to an image file, creating its directory.
+
+    The figures are laid out at 100 dots per inch, where one tile pixel of a glyph sheet is one pixel. A
+    multiple of that keeps the tiles sharp and makes the text crisp when the image is zoomed.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    FigureCanvasAgg(figure)
+    figure.savefig(path, dpi=dpi)
+    return path
 
 
 def _figure(width: float, height: float, title: str, subtitle: str = '') -> Figure:
@@ -482,33 +499,88 @@ def plot_confusion(names: Sequence[str], matrix: np.ndarray) -> Figure:
     return figure
 
 
-def plot_latent_health(spread: np.ndarray, norms: np.ndarray) -> Figure:
+def plot_latent_health(spread: np.ndarray, norms: np.ndarray, separation=None, accuracy: Optional[np.ndarray] = None,
+                       ks: Sequence[int] = (1, 5)) -> Figure:
     """
-    Whether the latent space is used: the spread of each dimension over the validation samples, and the
-    lengths of the latent vectors.
+    Whether the latent space is used, and for what.
 
-    A dimension with almost no spread carries no information. Lengths that drift far apart make the
-    reconstruction depend on something the cosine similarity ignores.
+    The bars split the variation of each dimension into the part that lies between fonts, which is what tells
+    them apart, and the part inside a font, which follows the text and blurs the fonts into each other. The
+    curve shows how well fonts are identified from only the most useful dimensions: where it flattens, the
+    remaining dimensions add little. The histogram shows the lengths of the latent vectors. Lengths that
+    drift far apart make the reconstruction depend on something the cosine similarity ignores.
+
+    :param spread: array (dimensions,), the standard deviation of each dimension over the samples
+    :param norms: array (samples,), the lengths of the latent vectors
+    :param separation: (between, within) of ValidationReport.font_separation. Without it the spread is drawn.
+    :param accuracy: array (len(ks), dimensions) of ValidationReport.accuracy_by_dimensions
+    :param ks: the k of each row of `accuracy`, at most two
     """
     spread, norms = np.asarray(spread), np.asarray(norms)
+    dimensions = len(spread)
     idle = int((spread < 0.05 * np.median(spread)).sum())
-    figure = _figure(
-        11.0, 4.7, 'Latent space',
-        f"{len(spread)} dimensions, {idle} of them nearly unused. "
-        f"Vector length {norms.mean():.2f} on average, from {norms.min():.2f} to {norms.max():.2f}.")
+    subtitle = (f"{dimensions} dimensions, {idle} of them nearly unused. "
+                f"Vector length {norms.mean():.2f} on average, from {norms.min():.2f} to {norms.max():.2f}.")
+    title_style = {'loc': 'left', 'fontsize': 10, 'color': INK_SECONDARY, 'pad': 8}
+    positions = np.arange(dimensions)
 
-    ax = _axes(figure, _rect(figure, 0.8, 0.75, 5.3, 2.6))
-    ax.bar(np.arange(len(spread)), spread, width=0.6, color=SERIES_1, linewidth=0)
-    ax.set_xlim(-0.8, len(spread) - 0.2)
+    if separation is None:
+        figure = _figure(11.0, 4.7, 'Latent space', subtitle)
+        ax = _axes(figure, _rect(figure, 0.8, 0.75, 5.3, 2.6))
+        ax.bar(positions, spread, width=0.6, color=SERIES_1, linewidth=0)
+        ax.set_ylabel('standard deviation over the samples')
+        ax.set_title('Spread of each dimension', **title_style)
+        histogram_rect = _rect(figure, 7.0, 0.75, 3.5, 2.6)
+    else:
+        between, within = (np.asarray(part, dtype=np.float64) for part in separation)
+        figure = _figure(11.0, 8.4, 'Latent space', subtitle)
+        ax = _axes(figure, _rect(figure, 0.8, 4.45, 9.7, 2.6))
+        ax.bar(positions, between, width=0.62, color=SERIES_1, linewidth=0, label='between fonts: tells them apart')
+        # a hairline of surface keeps the two parts of a bar apart
+        ax.bar(positions, within, bottom=between, width=0.62, color=SERIES_2, linewidth=0.6, edgecolor=SURFACE,
+               label='inside a font: follows the text and the capture')
+        ax.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda value, _: f"{100 * value:g}%"))
+        ax.set_ylim(0, 1.22 * max(float((between + within).max()), 1e-6))  # room for the legend above the bars
+        ax.set_ylabel('share of all variation')
+        ax.set_title(f"What each dimension contributes. {between.sum():.0%} of all variation lies between fonts, "
+                     f"the best dimension holds {between.max() / max(between.sum(), 1e-12):.1%} of that.", **title_style)
+        legend = ax.legend(loc='upper right', frameon=False, fontsize=9, ncols=2, borderaxespad=0.2,
+                           handlelength=1.2, handleheight=0.8)
+        for text in legend.get_texts():
+            text.set_color(INK_SECONDARY)
+        histogram_rect = _rect(figure, 7.4, 0.75, 3.1, 2.6)
+
+        if accuracy is not None:
+            accuracy = np.atleast_2d(np.asarray(accuracy, dtype=np.float64))[:2]
+            counts = np.arange(1, accuracy.shape[1] + 1)
+            curve = _axes(figure, _rect(figure, 0.8, 0.75, 4.7, 2.6))
+            for row, (values, color) in enumerate(zip(accuracy, (SERIES_1, SERIES_2))):
+                curve.plot(counts, values, color=color, linewidth=2, solid_capstyle='round', solid_joinstyle='round')
+                curve.annotate(f"top-{ks[row]}  {values[-1]:.1%}", (counts[-1], values[-1]), xytext=(6, 0),
+                               textcoords='offset points', color=INK, fontsize=9, va='center', annotation_clip=False)
+            # where the first curve gets close to its end: the dimensions after that add little
+            enough = int(np.argmax(accuracy[0] >= 0.95 * accuracy[0, -1])) + 1
+            if accuracy[0, -1] > 0 and enough < accuracy.shape[1]:
+                curve.plot([enough], [accuracy[0, enough - 1]], marker='o', markersize=8, color=SERIES_1,
+                           markeredgecolor=SURFACE, markeredgewidth=2, zorder=3)
+                # the note goes to the lower right, which rising curves leave empty
+                curve.text(0.98, 0.07, f"\u25cf  {enough} dimensions give 95% of the top-{ks[0]} accuracy",
+                           transform=curve.transAxes, color=INK, fontsize=9, ha='right')
+            curve.set_xlim(0, accuracy.shape[1] * 1.02)
+            curve.set_ylim(0, 1)
+            curve.set_yticks(np.linspace(0, 1, 5))
+            curve.set_yticklabels([f"{value:.0%}" for value in np.linspace(0, 1, 5)])
+            curve.set_xlabel('dimensions used, the most useful first')
+            curve.set_title('Identification with only some dimensions', **title_style)
+
+    ax.set_xlim(-0.8, dimensions - 0.2)
     ax.set_xlabel('latent dimension')
-    ax.set_ylabel('standard deviation over the samples')
-    ax.set_title('Spread of each dimension', loc='left', fontsize=10, color=INK_SECONDARY, pad=8)
 
-    ax = _axes(figure, _rect(figure, 7.0, 0.75, 3.5, 2.6))
+    ax = _axes(figure, histogram_rect)
     ax.hist(norms, bins=30, color=SERIES_1, rwidth=0.82, linewidth=0)
     ax.set_xlabel('length of the latent vector')
     ax.set_ylabel('samples')
-    ax.set_title('Lengths of the latent vectors', loc='left', fontsize=10, color=INK_SECONDARY, pad=8)
+    ax.set_title('Lengths of the latent vectors', **title_style)
     return figure
 
 
@@ -530,7 +602,8 @@ def _scale_legend(figure: Figure, rect, cmap, low: float, high: float, labels: S
 
 
 def plot_latent_comparison(latent: np.ndarray, groups: Sequence[int], fonts: Sequence[str], texts: Sequence[str],
-                           mean: np.ndarray, spread: np.ndarray, font_signal: np.ndarray) -> Figure:
+                           mean: np.ndarray, spread: np.ndarray, font_signal: np.ndarray,
+                           steady: float = 0.5, differing: float = 1.5) -> Figure:
     """
     Latent vectors side by side, feature by feature, with the similarity of every pair of them.
 
@@ -539,11 +612,17 @@ def plot_latent_comparison(latent: np.ndarray, groups: Sequence[int], fonts: Seq
     and changes between fonts tells fonts apart. A column that changes within a font reacts to the text. The
     bars above say the same over the whole validation set. Right: the cosine similarity of every pair of rows.
 
+    Below the rows of each font, every column is marked by how far its values lie apart over the texts of that
+    font: a dot where they stay within `steady` spreads of each other, so the feature describes the font, and a
+    cross where they lie `differing` spreads or more apart, so it follows the text. Columns in between get no
+    mark.
+
     :param latent: array (rows, latent_dim)
     :param groups: the font group of each row, rows of one group are adjacent
     :param fonts, texts: font name and text of each row
     :param mean, spread: mean and standard deviation of each latent dimension over the validation set
     :param font_signal: share of the variation of each dimension that lies between fonts, in [0, 1]
+    :param steady, differing: the two limits of the marks, in spreads of a feature over the validation set
     """
     latent = np.asarray(latent, dtype=np.float64)
     rows, dims = latent.shape
@@ -561,8 +640,21 @@ def plot_latent_comparison(latent: np.ndarray, groups: Sequence[int], fonts: Seq
         summary = (f" Cosine similarity {within.mean():.2f} between texts of one font, "
                    f"{between.mean():.2f} between fonts.")
 
+    # the rows of the map: those of the images, and below each font one for the marks of its columns
+    order = list(dict.fromkeys(groups.tolist()))
+    members = [np.flatnonzero(groups == group) for group in order]
+    positions, mark_rows, map_rows = np.zeros(rows, dtype=int), [], 0
+    for indices in members:
+        positions[indices] = map_rows + np.arange(len(indices))
+        mark_rows.append(map_rows + len(indices))
+        map_rows += len(indices) + 1
+    cells = np.full((map_rows, dims), np.nan)
+    cells[positions] = relative
+    # how far the values of a feature lie apart over the texts of a font
+    spans = [np.ptp(relative[indices], axis=0) if len(indices) > 1 else None for indices in members]
+
     cell_width, cell_height, label_width = 0.27, 0.25, 3.3
-    map_width, map_height = dims * cell_width, rows * cell_height
+    map_width, map_height = dims * cell_width, map_rows * cell_height
     matrix_size = rows * 0.21
     figure = _figure(
         0.5 + label_width + map_width + 1.1 + matrix_size + 0.5, 1.2 + 1.35 + map_height + 1.0,
@@ -571,6 +663,7 @@ def plot_latent_comparison(latent: np.ndarray, groups: Sequence[int], fonts: Seq
         'between fonts tells fonts apart.' + summary)
     bottom, left = 0.95, 0.5 + label_width
     boundaries = [index - 0.5 for index in range(1, rows) if groups[index] != groups[index - 1]]
+    label_x = -0.6 - label_width / cell_width + 0.2
 
     # how much each feature tells fonts apart, over the whole validation set
     ax = _axes(figure, _rect(figure, left, bottom + map_height + 0.3, map_width, 0.9))
@@ -586,13 +679,24 @@ def plot_latent_comparison(latent: np.ndarray, groups: Sequence[int], fonts: Seq
     # every feature of every row
     ax = _axes(figure, _rect(figure, left, bottom, map_width, map_height), grid_axis=None)
     ax.spines['bottom'].set_visible(False)
-    ax.imshow(relative, cmap=DIVERGING, vmin=-3, vmax=3, aspect='auto', interpolation='nearest')
+    cmap = DIVERGING.copy()
+    cmap.set_bad(SURFACE)
+    ax.imshow(cells, cmap=cmap, vmin=-3, vmax=3, aspect='auto', interpolation='nearest')
     ax.set_xticks(np.arange(dims + 1) - 0.5, minor=True)
-    ax.set_yticks(np.arange(rows + 1) - 0.5, minor=True)
+    ax.set_yticks(np.arange(map_rows + 1) - 0.5, minor=True)
     ax.grid(which='minor', color=SURFACE, linewidth=2)
     ax.tick_params(which='minor', length=0)
-    for boundary in boundaries:
-        ax.axhline(boundary, color=SURFACE, linewidth=7)
+    # the marks sit close under the rows they belong to, which leaves a gap to the next font
+    for mark_row, span, indices in zip(mark_rows, spans, members):
+        if span is None:
+            continue
+        agree, differ = np.flatnonzero(span <= steady), np.flatnonzero(span >= differing)
+        ax.scatter(agree, np.full(len(agree), mark_row - 0.2), marker='o', s=20, color=INK, linewidths=0)
+        ax.scatter(differ, np.full(len(differ), mark_row - 0.2), marker='x', s=22, color=INK, linewidths=1.3)
+        ax.text(label_x + 1.3, positions[indices[0]] + 1.5, f"\u25cf {len(agree)} steady    \u00d7 {len(differ)} follow the text",
+                color=INK_MUTED, fontsize=8, va='center', ha='left')
+    ax.set_xlim(-0.5, dims - 0.5)
+    ax.set_ylim(map_rows - 0.5, -0.5)
     ax.set_xticks(np.arange(0, dims, 4))
     ax.set_xticklabels([str(index) for index in range(0, dims, 4)], fontsize=8)
     ax.set_xlabel('latent feature')
@@ -600,12 +704,23 @@ def plot_latent_comparison(latent: np.ndarray, groups: Sequence[int], fonts: Seq
     previous = None
     for row in range(rows):
         if groups[row] != previous:
-            ax.text(-0.6 - label_width / cell_width + 0.2, row, f"{groups[row] + 1}  {display_text(fonts[row])[:24]}",
+            ax.text(label_x, positions[row], f"{groups[row] + 1}  {display_text(fonts[row])[:24]}",
                     color=INK, fontsize=9, fontweight='bold', va='center', ha='left')
             previous = groups[row]
-        ax.text(-0.8, row, display_text(texts[row]), color=INK_SECONDARY, fontsize=9, va='center', ha='right')
+        ax.text(-0.8, positions[row], display_text(texts[row]), color=INK_SECONDARY, fontsize=9, va='center',
+                ha='right')
     _scale_legend(figure, _rect(figure, left, 0.38, 3.2, 0.12), DIVERGING, -3, 3,
                   ['-3 spreads', 'validation average', '+3 spreads'])
+    if any(span is not None for span in spans):
+        note = _image_axes(figure, _rect(figure, left + 3.7, 0.2, 9.0, 0.36))
+        note.set_xlim(0, 1)
+        note.set_ylim(0, 1)
+        note.scatter([0.008], [0.72], marker='o', s=20, color=INK, linewidths=0)
+        note.text(0.022, 0.72, f"the texts of the font lie within {steady:g} spreads of each other in this feature: "
+                  "it describes the font", color=INK_SECONDARY, fontsize=8, va='center')
+        note.scatter([0.008], [0.22], marker='x', s=22, color=INK, linewidths=1.3)
+        note.text(0.022, 0.22, f"they lie {differing:g} spreads or more apart: it follows the text or the capture",
+                  color=INK_SECONDARY, fontsize=8, va='center')
 
     # how alike every pair of rows is
     left += map_width + 1.1

@@ -86,10 +86,34 @@ def test_conditioned_decoder():
     latent = torch.randn(4, 32)
     assert torch.allclose(model.decode(latent)[2], model.decode(latent[2:3])[0], atol=1e-5)
 
+    # single glyphs are the same as when the whole fingerprint is drawn
+    picked = torch.tensor([[0, 6], [3, 3], [5, 1], [2, 0]])
+    some = model.decode_glyphs(latent, picked)
+    assert some.shape == (4, 2, 16, 32)
+    whole = model.decode(latent)
+    for sample in range(4):
+        for position in range(2):
+            assert torch.allclose(some[sample, position], whole[sample, picked[sample, position]], atol=1e-5)
+    output, _ = model(torch.zeros(4, 1, 32, 128), return_latent=True, glyphs=picked)
+    assert output.shape == (4, 2, 16, 32)
+    # all glyphs of many samples are drawn in several passes with the same result
+    model._GLYPHS_PER_PASS = 5
+    assert torch.allclose(model.decode(latent), whole, atol=1e-5)
+
     with pytest.raises(ValueError):
         CompactAutoEncoder(decoder_type='attention')
     with pytest.raises(ValueError):
         CompactAutoEncoder(decoder_blocks=0)
+
+
+def test_joint_decoder_picks_single_glyphs_from_the_fingerprint():
+    model = CompactAutoEncoder(decoder_output_channels=7).eval()
+    latent = torch.randn(3, 32)
+    picked = torch.tensor([[6, 0, 0], [1, 2, 3], [4, 4, 5]])
+    some = model.decode_glyphs(latent, picked)
+    assert some.shape == (3, 3, 32, 32)
+    whole = model.decode(latent)
+    assert torch.equal(some[1, 2], whole[1, 3]) and torch.equal(some[0, 1], whole[0, 0])
 
 
 def test_glyph_discriminator():

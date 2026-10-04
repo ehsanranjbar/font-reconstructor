@@ -1,10 +1,22 @@
 import os
 import re
-from typing import List
+from typing import Dict, List, Optional
 
+import numpy as np
 import pandas as pd
 from PIL import ImageFont, features
 from tqdm import tqdm
+
+from .rendering import Variant
+
+# How a synthetic font of each style is drawn, and which real fonts it can be made from. The widths are
+# fractions of the font size.
+SYNTHETIC_STYLES = {
+    'outline': (Variant(outline=0.03), ('regular', 'bold', 'light')),
+    'italic': (Variant(slant=0.2), ('regular',)),
+    'bold italic': (Variant(slant=0.2), ('bold',)),
+    'bold': (Variant(weight=0.03), ('regular',)),
+}
 
 _LAYOUT_ENGINES = {
     'basic': ImageFont.Layout.BASIC,
@@ -91,9 +103,16 @@ class FontSet:
 
     Fonts that fail to open or miss a glyph of their charset are dropped. Fonts are addressed by their position
     in the remaining list.
+
+    :param synthetic_variants: dict of style to the number of extra fonts to make of that style, for example
+        {"outline": 200, "italic": 120}. Each one is a real font drawn outlined, slanted or heavier, see
+        SYNTHETIC_STYLES. It is a font of its own, with its own text images and fingerprint, in the family of
+        the font it is made from. This fills up the styles that a collection has few fonts of.
+    :param variant_seed: seed of the choice of the fonts that the variants are made from
     """
 
-    def __init__(self, fonts_dir: str, annotation_file: str, font_size: int = 32, layout_engine: str = 'auto'):
+    def __init__(self, fonts_dir: str, annotation_file: str, font_size: int = 32, layout_engine: str = 'auto',
+                 synthetic_variants: Optional[Dict[str, int]] = None, variant_seed: int = 0):
         self.fonts_dir = fonts_dir
         self.font_size = font_size
         self.layout_engine = resolve_layout_engine(layout_engine)
@@ -141,12 +160,43 @@ class FontSet:
             style = row["style"] if has_style and isinstance(row["style"], str) else None
             self.styles.append(style or derive_style(row["font"], ttf.getname()[1]))
 
+        # how each font is drawn: None for a real font, a Variant for a synthetic one
+        self.variants: List[Optional[Variant]] = [None] * len(self.names)
+        real_fonts = len(self.names)
+        self._add_synthetic_variants(synthetic_variants or {}, variant_seed)
+
         # the classes of the style head, in a fixed order
         self.style_names: List[str] = sorted(set(self.styles))
         self.style_indices: List[int] = [self.style_names.index(style) for style in self.styles]
 
-        tqdm.write(f"Loaded {len(self.names)} fonts of {len(set(self.families))} families and "
+        synthetic = len(self.names) - real_fonts
+        tqdm.write(f"Loaded {real_fonts} fonts of {len(set(self.families))} families and "
                    f"{len(self.style_names)} styles, ignored {ignored_fonts}")
+        if synthetic:
+            tqdm.write(f"Made {synthetic} synthetic variants of them, {len(self.names)} fonts in all")
+
+    def _add_synthetic_variants(self, counts: Dict[str, int], seed: int):
+        """
+        append fonts that are real fonts drawn as another style
+        """
+        rng = np.random.default_rng(seed)
+        real_styles = list(self.styles)
+        for style, count in counts.items():
+            if style not in SYNTHETIC_STYLES:
+                raise ValueError(f"No synthetic variant makes the style '{style}'. "
+                                 f"Valid options are {sorted(SYNTHETIC_STYLES)}.")
+            variant, source_styles = SYNTHETIC_STYLES[style]
+            sources = [index for index, source in enumerate(real_styles) if source in source_styles]
+            for index in rng.permutation(sources)[:count]:
+                self.names.append(f"{self.names[index]} ({style}, synthetic)")
+                self.files.append(self.files[index])
+                self.charsets.append(self.charsets[index])
+                self.families.append(self.families[index])
+                self.styles.append(style)
+                self.variants.append(variant)
+
+    def is_synthetic(self, index: int) -> bool:
+        return self.variants[index] is not None
 
     def _open(self, font_path: str) -> ImageFont.FreeTypeFont:
         return ImageFont.truetype(
@@ -177,7 +227,8 @@ class FontSet:
         """
         everything that determines what this font set renders, used to key caches
         """
-        return [self.font_size, self.num_glyphs, self.layout_engine, self.names, self.files, self.charsets]
+        variants = [None if variant is None else variant.signature() for variant in self.variants]
+        return [self.font_size, self.num_glyphs, self.layout_engine, self.names, self.files, self.charsets, variants]
 
     def __getstate__(self):
         # opened font handles are not sent to data loader workers

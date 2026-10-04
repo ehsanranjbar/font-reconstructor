@@ -6,7 +6,7 @@ from font_reconstructor import factory
 from font_reconstructor.config import ConfigParser
 from font_reconstructor.evaluation import build_topk_accuracy, evaluate
 from font_reconstructor.trainer import strip_data_parallel_prefix
-from font_reconstructor.utils import prepare_device, seed_everything
+from font_reconstructor.utils import prepare_device, raise_open_file_limit, seed_everything
 
 
 def main(config):
@@ -19,6 +19,7 @@ def main(config):
     :return: dict of the loss, metrics and top-k accuracies
     """
     logger = config.get_logger('test')
+    raise_open_file_limit()
     assert config.resume is not None, "A checkpoint needs to be specified. Add '-r path/to/checkpoint.pth', for example."
 
     seed_everything(config.get('seed', 42))

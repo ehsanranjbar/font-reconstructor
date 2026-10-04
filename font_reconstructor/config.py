@@ -1,8 +1,7 @@
 import logging
 import os
 from datetime import datetime
-from functools import partial, reduce
-from operator import getitem
+from functools import partial
 from pathlib import Path
 
 from font_reconstructor.logger import setup_logging
@@ -158,11 +157,10 @@ def _get_opt_name(flags):
 
 
 def _set_by_path(tree, keys, value):
-    """Set a value in a nested object in tree by sequence of keys."""
+    """Set a value in a nested object in tree by sequence of keys. Blocks that the config leaves out are created."""
     keys = keys.split(';')
-    _get_by_path(tree, keys[:-1])[keys[-1]] = value
-
-
-def _get_by_path(tree, keys):
-    """Access a nested object in tree by sequence of keys."""
-    return reduce(getitem, keys, tree)
+    for key in keys[:-1]:
+        if tree.get(key) is None:
+            tree[key] = {}
+        tree = tree[key]
+    tree[keys[-1]] = value
