@@ -179,7 +179,7 @@ class RandomTextImageDataset(Dataset):
         if not self.group_by_font:
             raise ValueError("sample_indices_by_font needs a dataset with group_by_font=True.")
         n_fonts = len(self.font_indices)
-        return [np.arange(position, self.total_samples, n_fonts) for position in range(n_fonts)]
+        return [range(position, self.total_samples, n_fonts) for position in range(n_fonts)]
 
     def __len__(self):
         return self.total_samples

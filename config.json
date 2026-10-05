@@ -6,10 +6,10 @@
     "arch": {
         "type": "CompactAutoEncoder",
         "args": {
-            "base_channels": 4,
+            "base_channels": 12,
             "latent_dim": 32,
             "decoder_type": "joint",
-            "decoder_channels": 4,
+            "decoder_channels": 16,
             "decoder_blocks": 1
         }
     },
@@ -46,14 +46,17 @@
     "data_loader": {
         "args": {
             "random_seed": 42,
-            "total_samples": 2000000,
+            "total_samples": 10000000,
+            "epoch_samples": 2000000,
+            "validation_samples": 150000,
+            "cache_images": false,
             "random_augmentations": true,
             "validation_augmentations": true,
             "validation_split": 0.1,
-            "batch_fonts": 64,
+            "batch_fonts": 128,
             "batch_samples_per_font": 4,
-            "batch_size": 256,
-            "num_workers": 12,
+            "batch_size": 512,
+            "num_workers": 6,
             "pin_memory": true
         }
     },

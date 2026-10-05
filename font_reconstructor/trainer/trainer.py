@@ -1,3 +1,4 @@
+import collections
 import math
 import shutil
 
@@ -74,6 +75,10 @@ class Trainer(BaseTrainer):
     image files to `figures/` in the log directory of the run, at `figure_dpi` dots per inch. These are settings
     of the trainer config.
     """
+
+    _RECENT_STEPS = 100  # steps that the loss on the progress bar is averaged over
+    # the step of the run, the time that is left and the loss, nothing else
+    _BAR_FORMAT = '{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{remaining} left{postfix}]'
 
     def __init__(self, model, criterion, metric_ftns, optimizer, config, device,
                  data_loader, valid_data_loader=None, clustering_data_loader=None, num_fonts=None,
@@ -210,12 +215,24 @@ class Trainer(BaseTrainer):
         """
         self.model.train()
         self.train_metrics.reset()
+        # a sampler whose epochs draw from different parts of the data has to know which epoch this is
+        batch_sampler = getattr(self.data_loader, 'batch_sampler', None)
+        if hasattr(batch_sampler, 'set_epoch'):
+            batch_sampler.set_epoch(epoch)
         adversarial = self.discriminator is not None and epoch >= self.adversarial_start_epoch
         if self.discriminator is not None:
             self.discriminator.train()
         batches = self.data_loader if self._batches is None else self._batches
-        train_loop = tqdm(batches, total=self.len_epoch, desc=f'Epoch [{epoch}]')
-        for batch_idx, batch in enumerate(train_loop):
+        # The bar counts the steps of the whole run, so that it shows how far the run is and when it ends
+        # also where an epoch is only a part of one long pass over the data.
+        steps_before = (epoch - 1) * self.len_epoch
+        # it is advanced by hand after every step: wrapped around the batches it would miss the last step of
+        # an epoch, which leaves the loop before the bar counts it
+        train_loop = tqdm(total=self.epochs * self.len_epoch, initial=steps_before,
+                          desc=f'Epoch {epoch}/{self.epochs}', bar_format=self._BAR_FORMAT)
+        shown_loss = 'total_loss' if 'total_loss' in self.train_metrics.keys else 'loss'
+        recent_losses = collections.deque(maxlen=self._RECENT_STEPS)
+        for batch_idx, batch in enumerate(batches):
             # write the model graph at first batch of epoch 1
             if epoch == 1 and batch_idx == 0 and self.writer.enabled:
                 self.writer.add_graph(move_model_to_cpu(self.model), input_to_model=batch['image'], verbose=False)
@@ -234,12 +251,11 @@ class Trainer(BaseTrainer):
             for met in self.metric_ftns:
                 self.train_metrics.update(met.__name__, met(output, target))
 
-            # the progress bar shows the loss that is optimized, and beside it the reconstruction loss if the
-            # two differ
-            shown = {'loss': '{:.4f}'.format(self.train_metrics.avg('loss'))}
-            if 'total_loss' in self.train_metrics.keys:
-                shown = {'total_loss': '{:.4f}'.format(self.train_metrics.avg('total_loss')), 'recon': shown['loss']}
-            train_loop.set_postfix(shown)
+            # The progress bar shows the loss that is optimized, averaged over the last steps: an average over
+            # a long epoch would mostly tell how its first steps went.
+            recent_losses.append(losses[shown_loss].item())
+            train_loop.set_postfix(loss='{:.4f}'.format(sum(recent_losses) / len(recent_losses)), refresh=False)
+            train_loop.update(1)
 
             if batch_idx + 1 >= self.len_epoch:
                 break

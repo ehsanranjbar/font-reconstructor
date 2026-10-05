@@ -226,6 +226,39 @@ def test_command_line_options_reach_blocks_the_config_leaves_out(fonts_dir, tmp_
     assert factory.build_reconstruction(parsed) == {'target_glyphs': 'all', 'glyphs_per_sample': 3}
 
 
+def test_train_on_fresh_samples_in_every_epoch(fonts_dir, tmp_path, capfd):
+    train = load_script('train')
+    config = make_config(fonts_dir, tmp_path, epochs=3)
+    config['data_loader']['args'].update(total_samples=96, epoch_samples=32, validation_samples=8, cache_images=False)
+    seen = []
+
+    from font_reconstructor.dataset import FontBalancedBatchSampler
+    original = FontBalancedBatchSampler.__iter__
+
+    def recording(self):
+        for batch in original(self):
+            seen.append((self.epoch, tuple(batch)))
+            yield batch
+
+    FontBalancedBatchSampler.__iter__ = recording
+    try:
+        train.main(ConfigParser(copy.deepcopy(config), run_id='fresh'))
+    finally:
+        FontBalancedBatchSampler.__iter__ = original
+
+    # the trainer told the sampler every epoch, and the epochs drew different samples
+    by_epoch = {epoch: {index for e, batch in seen for index in batch if e == epoch} for epoch in (1, 2, 3)}
+    assert all(by_epoch.values())
+    assert not by_epoch[1] & by_epoch[2] and not by_epoch[2] & by_epoch[3] and not by_epoch[1] & by_epoch[3]
+    # the training texts were rendered when read: only validation images, reference images and fingerprints are files
+    assert sorted(path.name.split('_')[0] for path in (tmp_path / 'cache').iterdir()) == ['fingerprints', 'images', 'images']
+    # the progress bar counts the steps of the whole run and shows the loss that is optimized, and little else
+    output = capfd.readouterr().err
+    bars = [line for line in output.replace('\r', '\n').split('\n') if line.startswith('Epoch ')]
+    assert bars[-1].startswith('Epoch 3/3') and '12/12' in bars[-1] and 'loss=' in bars[-1]
+    assert not any('total_loss' in bar or 'it/s' in bar or 'lr=' in bar for bar in bars)
+
+
 def test_train_with_style_head(fonts_dir, tmp_path):
     train = load_script('train')
     test = load_script('test')

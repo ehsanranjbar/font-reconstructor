@@ -10,6 +10,9 @@ from .samplers import FontBalancedBatchSampler
 from .transforms import image_transform, target_transform
 
 
+_VALIDATION_SEED_OFFSET = 1_000_000_000
+
+
 def split_fonts(fonts: FontSet, validation_split: Union[int, float], seed: int = 0):
     """
     Hold out whole font families for validation.
@@ -64,6 +67,7 @@ def make_train_valid_loaders(
     number_ratio: float = 0.0,
     render_scale: int = 2,
     cache_images: bool = True,
+    cache_validation_images: bool = True,
     cache_dir: str = DEFAULT_CACHE_DIR,
     random_augmentations: bool = True,
     validation_augmentations: bool = False,
@@ -74,6 +78,8 @@ def make_train_valid_loaders(
     shuffle: bool = True,
     batch_fonts: Optional[int] = None,
     batch_samples_per_font: int = 4,
+    epoch_samples: Optional[int] = None,
+    validation_samples: Optional[int] = None,
     num_workers: int = 1,
     pin_memory: bool = False,
 ):
@@ -93,6 +99,18 @@ def make_train_valid_loaders(
     :param capture_options: arguments of CaptureSimulation
     :param batch_fonts: if given, training batches hold `batch_fonts` fonts with `batch_samples_per_font`
         samples each, as a contrastive loss needs. `batch_size` and `shuffle` are not used then.
+    :param cache_images: keep the renderings of the training texts in a file under `cache_dir`. Without it
+        every text is rendered when it is read, which gives the same images, needs no disk space and no time
+        before the run, and so allows training sets of any size. The data loader workers then open the fonts
+        themselves, which takes about a gigabyte of memory in each of them for a thousand fonts.
+    :param cache_validation_images: the same for the validation texts. They are read again in every epoch,
+        so a file is the better place for them.
+    :param epoch_samples: number of training samples of an epoch, for a training set that is larger than one
+        epoch. Every epoch then draws from its own part of the set, see FontBalancedBatchSampler. With
+        `total_samples` of epochs times `epoch_samples`, no text is trained on twice. Needs `batch_fonts`.
+    :param validation_samples: number of validation samples. Then all `total_samples` are for training, and
+        the validation texts do not depend on the size of the training set. By default the validation set
+        takes its share of `total_samples`.
     :return: (train loader, validation loader). The validation loader is None if `validation_split` is 0.
     """
     if random_seed is None:
@@ -103,10 +121,22 @@ def make_train_valid_loaders(
         # validation measures real fonts only. The synthetic variants of held out fonts are not trained on
         # either, since they are in the family of their font: they only stand among the fonts to choose from.
         valid_fonts = np.array([index for index in valid_fonts if not fonts.is_synthetic(index)])
-    n_valid = 0 if valid_fonts is None else max(1, round(total_samples * len(valid_fonts) / len(fonts)))
-    n_train = total_samples - n_valid
-    if n_train < 1:
-        raise ValueError("total_samples is too small to leave samples for training.")
+    if valid_fonts is None:
+        n_valid, n_train = 0, total_samples
+    elif validation_samples is not None:
+        n_valid, n_train = int(validation_samples), total_samples
+        # a fixed distance from the training seeds, so that the validation set is the same for every size
+        # of the training set
+        valid_seed = random_seed + _VALIDATION_SEED_OFFSET
+    else:
+        n_valid = max(1, round(total_samples * len(valid_fonts) / len(fonts)))
+        n_train = total_samples - n_valid
+        # seeds past those of the training samples, so validation does not repeat the training texts
+        valid_seed = random_seed + n_train
+    if n_train < 1 or (valid_fonts is not None and n_valid < 1):
+        raise ValueError("total_samples is too small to leave samples for training and validation.")
+    if epoch_samples is not None and batch_fonts is None:
+        raise ValueError("epoch_samples needs batch_fonts, which sets how the samples of an epoch are drawn.")
 
     dataset_kwargs = {
         'corpus': corpus,
@@ -115,7 +145,6 @@ def make_train_valid_loaders(
         'font_fingerprint_dims': font_fingerprint_dims,
         'number_ratio': number_ratio,
         'render_scale': render_scale,
-        'cache_images': cache_images,
         'cache_dir': cache_dir,
     }
     capture_options = capture_options or {}
@@ -127,6 +156,7 @@ def make_train_valid_loaders(
         random_seed=random_seed,
         total_samples=n_train,
         group_by_font=batch_fonts is not None,
+        cache_images=cache_images,
         **dataset_kwargs,
     )
     train_set = TransformedSubset(
@@ -136,7 +166,8 @@ def make_train_valid_loaders(
     )
     if batch_fonts is not None:
         batch_sampler = FontBalancedBatchSampler(
-            train_dataset.sample_indices_by_font(), batch_fonts, batch_samples_per_font)
+            train_dataset.sample_indices_by_font(), batch_fonts, batch_samples_per_font,
+            samples_per_epoch=epoch_samples)
         train_loader = DataLoader(train_set, batch_sampler=batch_sampler, **worker_kwargs)
     else:
         train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=shuffle, **worker_kwargs)
@@ -146,10 +177,10 @@ def make_train_valid_loaders(
         valid_dataset = RandomTextImageDataset(
             fonts,
             font_indices=valid_fonts,
-            # seeds past those of the training samples, so validation does not repeat the training texts
-            random_seed=random_seed + n_train,
+            random_seed=valid_seed,
             total_samples=n_valid,
             group_by_font=True,
+            cache_images=cache_validation_images,
             **dataset_kwargs,
         )
         valid_set = TransformedSubset(

@@ -181,7 +181,7 @@ def test_font_indices_restrict_the_fonts(fonts, tmp_path):
     grouped = make_dataset(fonts, tmp_path, font_indices=[2, 1], total_samples=7, group_by_font=True,
                            cache_images=False)
     assert [grouped[idx]['font_index'] for idx in range(7)] == [2, 1, 2, 1, 2, 1, 2]
-    assert [indices.tolist() for indices in grouped.sample_indices_by_font()] == [[0, 2, 4, 6], [1, 3, 5]]
+    assert [list(indices) for indices in grouped.sample_indices_by_font()] == [[0, 2, 4, 6], [1, 3, 5]]
 
     with pytest.raises(ValueError):
         random_fonts.sample_indices_by_font()
@@ -289,6 +289,104 @@ def test_font_balanced_batches():
 
     with pytest.raises(ValueError):
         FontBalancedBatchSampler(indices_by_font, fonts_per_batch=4, samples_per_font=1)
+
+
+def test_epochs_can_draw_from_their_own_part_of_the_samples():
+    # six fonts with forty samples each, as ranges like those of a dataset
+    indices_by_font = [range(start, 240, 6) for start in range(6)]
+    sampler = FontBalancedBatchSampler(indices_by_font, fonts_per_batch=3, samples_per_font=4, samples_per_epoch=60)
+    # the dataset holds four epochs of sixty samples, in batches of twelve
+    assert sampler.parts == 4 and len(sampler) == 5
+
+    torch.manual_seed(0)
+    seen = []
+    for epoch in range(1, 5):
+        sampler.set_epoch(epoch)
+        batches = list(sampler)
+        assert len(batches) == 5 and all(len(batch) == 12 for batch in batches)
+        for batch in batches:
+            assert sorted(collections.Counter(index % 6 for index in batch).values()) == [4, 4, 4]
+        seen.append({index for batch in batches for index in batch})
+    # no sample is drawn in two epochs, and every epoch stays within its tenth to twentieth sample of a font
+    for first in range(4):
+        for second in range(first + 1, 4):
+            assert not seen[first] & seen[second]
+        assert all(first * 10 <= index // 6 < (first + 1) * 10 for index in seen[first])
+
+    # a font goes through all its samples of the part before one of them comes again
+    one_font = FontBalancedBatchSampler([range(0, 40)], fonts_per_batch=1, samples_per_font=2, samples_per_epoch=10)
+    one_font.set_epoch(2)
+    assert sorted(index for batch in one_font for index in batch) == list(range(10, 20))
+
+    # after the last part the first one comes again, and the epoch is what decides, not the number of passes
+    sampler.set_epoch(5)
+    assert {index for batch in sampler for index in batch} <= {index for index in range(240) if index // 6 < 10}
+    sampler.set_epoch(2)
+    torch.manual_seed(3)
+    again = list(sampler)
+    torch.manual_seed(3)
+    assert list(sampler) == again
+
+    with pytest.raises(ValueError):
+        FontBalancedBatchSampler(indices_by_font, 3, 4, batches_per_epoch=2, samples_per_epoch=60)
+    with pytest.raises(ValueError):
+        FontBalancedBatchSampler(indices_by_font, 3, 4, samples_per_epoch=1000)
+    with pytest.raises(ValueError, match='fewer samples'):
+        FontBalancedBatchSampler([range(0, 3), range(3, 240)], 2, 2, samples_per_epoch=10)
+
+
+def test_rendering_when_read_gives_the_cached_images(fonts, corpus_file, tmp_path):
+    corpus = TextCorpus([str(corpus_file)])
+    settings = dict(random_seed=7, total_samples=60, validation_split=0.34, batch_fonts=2, batch_samples_per_font=2,
+                    num_workers=0, corpus=corpus, number_ratio=0.3, random_augmentations=False)
+    cache_dir = tmp_path / 'cache'
+    cached_train, cached_valid = make_train_valid_loaders(fonts, cache_dir=str(cache_dir), **settings)
+    assert len(list(cache_dir.glob('images_*.npy'))) == 2
+
+    live_dir = tmp_path / 'live'
+    live_train, live_valid = make_train_valid_loaders(
+        fonts, cache_dir=str(live_dir), cache_images=False, cache_validation_images=False, **settings)
+    # only the fingerprints are kept in a file
+    assert [path.name.split('_')[0] for path in live_dir.iterdir()] == ['fingerprints']
+
+    for cached, live in ((cached_train, live_train), (cached_valid, live_valid)):
+        assert len(cached.dataset) == len(live.dataset)
+        for index in range(len(cached.dataset)):
+            first, second = cached.dataset[index], live.dataset[index]
+            assert first['text'] == second['text'] and first['font_index'] == second['font_index']
+            assert torch.equal(first['image'], second['image'])
+            assert torch.equal(second['image'], live.dataset[index]['image'])
+
+    # by default the validation images are still kept in a file, they are read in every epoch
+    mixed_dir = tmp_path / 'mixed'
+    make_train_valid_loaders(fonts, cache_dir=str(mixed_dir), cache_images=False, **settings)
+    assert sorted(path.name.split('_')[0] for path in mixed_dir.iterdir()) == ['fingerprints', 'images']
+
+
+def test_training_set_larger_than_an_epoch(fonts, tmp_path):
+    settings = dict(random_seed=7, validation_split=0.34, batch_fonts=2, batch_samples_per_font=2, num_workers=0,
+                    cache_dir=str(tmp_path / 'cache'), cache_images=False)
+    train_loader, valid_loader = make_train_valid_loaders(
+        fonts, total_samples=120, epoch_samples=40, validation_samples=10, **settings)
+    # all samples are for training, and an epoch is a third of them
+    assert len(train_loader.dataset) == 120 and len(valid_loader.dataset) == 10
+    assert len(train_loader) == 10 and train_loader.batch_sampler.parts == 3
+
+    def texts(loader):
+        return [text for batch in loader for text in batch['text']]
+
+    # the validation set does not depend on the size of the training set
+    _, other_valid = make_train_valid_loaders(fonts, total_samples=400, epoch_samples=40, validation_samples=10, **settings)
+    assert texts(other_valid) == texts(valid_loader)
+
+    train_loader.batch_sampler.set_epoch(1)
+    first = {int(index) for batch in train_loader.batch_sampler for index in batch}
+    train_loader.batch_sampler.set_epoch(2)
+    assert not first & {int(index) for batch in train_loader.batch_sampler for index in batch}
+
+    with pytest.raises(ValueError, match='batch_fonts'):
+        make_train_valid_loaders(fonts, total_samples=120, epoch_samples=40, validation_split=0.34, num_workers=0,
+                                 cache_dir=str(tmp_path / 'cache'))
 
 
 def test_train_valid_loaders_hold_out_fonts(fonts, tmp_path):
