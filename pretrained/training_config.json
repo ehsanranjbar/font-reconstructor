@@ -1,0 +1,128 @@
+{
+    "name": "compact_supcon",
+    "seed": 42,
+    "n_gpu": 1,
+    "device": "auto",
+    "arch": {
+        "type": "CompactAutoEncoder",
+        "args": {
+            "base_channels": 12,
+            "latent_dim": 32,
+            "decoder_type": "joint",
+            "decoder_channels": 16,
+            "decoder_blocks": 1
+        }
+    },
+    "dataset": {
+        "fonts_dir": "data/fonts",
+        "annotation_file": "data/fonts.csv",
+        "font_size": 96,
+        "layout_engine": "raqm",
+        "synthetic_variants": {
+            "outline": 200,
+            "italic": 120,
+            "bold italic": 100
+        },
+        "corpus_files": [
+            "data/corpus/shahnameh.txt",
+            "data/corpus/words.txt"
+        ],
+        "text_length": [
+            6,
+            16
+        ],
+        "number_ratio": 0.1,
+        "text_image_dims": [
+            256,
+            64
+        ],
+        "font_fingerprint_dims": [
+            64,
+            64
+        ],
+        "render_scale": 1,
+        "cache_dir": "data/cache"
+    },
+    "data_loader": {
+        "args": {
+            "random_seed": 42,
+            "total_samples": 10000000,
+            "epoch_samples": 2000000,
+            "validation_samples": 150000,
+            "cache_images": false,
+            "random_augmentations": true,
+            "validation_augmentations": true,
+            "validation_split": 0.1,
+            "batch_fonts": 128,
+            "batch_samples_per_font": 4,
+            "batch_size": 512,
+            "num_workers": 6,
+            "pin_memory": true
+        }
+    },
+    "clustering_data_loader": {
+        "args": {
+            "random_seed": 123,
+            "samples_per_font": 100,
+            "random_augmentations": true,
+            "batch_size": 256,
+            "num_workers": 12,
+            "pin_memory": true
+        }
+    },
+    "optimizer": {
+        "type": "Adam",
+        "args": {
+            "lr": 0.016,
+            "weight_decay": 0,
+            "amsgrad": true
+        }
+    },
+    "loss": "multiscale_l1_loss",
+    "reconstruction": {
+        "glyphs": "all",
+        "glyphs_per_sample": 8
+    },
+    "contrastive_loss": {
+        "weight": 0.5,
+        "temperature": 0.1
+    },
+    "style_head": {
+        "weight": 0.2,
+        "detach": false
+    },
+    "adversarial_loss": {
+        "weight": 0.0,
+        "start_epoch": 5,
+        "lr": 0.0002,
+        "discriminator_channels": 32
+    },
+    "metrics": [],
+    "lr_scheduler": {
+        "type": "OneCycleLR",
+        "interval": "batch",
+        "args": {
+            "max_lr": 0.016,
+            "pct_start": 0.05,
+            "div_factor": 20,
+            "final_div_factor": 100
+        }
+    },
+    "trainer": {
+        "epochs": 5,
+        "save_dir": "saved/",
+        "save_period": 1,
+        "keep_last_checkpoints": 5,
+        "verbosity": 2,
+        "monitor": "max val_top1_acc",
+        "early_stop": 10,
+        "topk": [
+            1,
+            5
+        ],
+        "tensorboard": true,
+        "figure_period": 1,
+        "save_figures": true,
+        "figure_dpi": 200
+    }
+}

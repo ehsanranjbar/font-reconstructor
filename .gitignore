@@ -100,11 +100,69 @@ ENV/
 # mypy
 .mypy_cache/
 
-# input data, saved log, checkpoints
-data/
-input/
+# Runs and caches stay local. Of the data only what may be redistributed is tracked: the annotation
+# files, the text corpus, and the fonts under a free licence, which are listed one by one so that no
+# other font file is added by accident. See data/fonts/README.md.
 saved/
+input/
 datasets/
+data/*
+!data/fonts.csv
+!data/fonts_manifest.csv
+!data/corpus/
+!data/fonts/
+data/fonts/*
+!data/fonts/README.md
+!data/fonts/OFL.txt
+!data/fonts/ReemKufi.ttf
+!data/fonts/Vazirmatn\[wght\].ttf
+!data/fonts/ArefRuqaa-Regular.ttf
+!data/fonts/Amiri-Regular.ttf
+!data/fonts/SahelFD-Light.ttf
+!data/fonts/Vazirmatn-RD-Thin.ttf
+!data/fonts/Vazirmatn-RD-ExtraBold.ttf
+!data/fonts/SahelVF-Regular.ttf
+!data/fonts/Amiri-Bold.ttf
+!data/fonts/ParastooFD-Bold.ttf
+!data/fonts/SamimFD-Medium.ttf
+!data/fonts/Vazirmatn-RD-Medium.ttf
+!data/fonts/Amiri-Italic.ttf
+!data/fonts/Vazirmatn-Medium.ttf
+!data/fonts/Vazirmatn-Light.ttf
+!data/fonts/Vazirmatn-SemiBold.ttf
+!data/fonts/Vazirmatn-RD-Regular.ttf
+!data/fonts/GandomFD-Regular.ttf
+!data/fonts/Vazirmatn-RD\[wght\].ttf
+!data/fonts/Vazirmatn-ExtraLight.ttf
+!data/fonts/NahidFD-Regular.ttf
+!data/fonts/SahelFD-SemiBold.ttf
+!data/fonts/ShabnamFD-Regular.ttf
+!data/fonts/Vazirmatn-Thin.ttf
+!data/fonts/Amiri-BoldItalic.ttf
+!data/fonts/SamimFD-Bold.ttf
+!data/fonts/ArefRuqaa-Bold.ttf
+!data/fonts/ShabnamFD-Medium.ttf
+!data/fonts/Vazirmatn-Black.ttf
+!data/fonts/SahelFD-Bold.ttf
+!data/fonts/Vazirmatn-RD-Bold.ttf
+!data/fonts/ShabnamFD-Light.ttf
+!data/fonts/Vazirmatn-Regular.ttf
+!data/fonts/Vazirmatn-Bold.ttf
+!data/fonts/ParastooFD-Regular.ttf
+!data/fonts/ShabnamFD-Bold.ttf
+!data/fonts/Vazirmatn-RD-Light.ttf
+!data/fonts/VazirCodeExtraHeightFD-Regular.ttf
+!data/fonts/Vazirmatn-RD-SemiBold.ttf
+!data/fonts/Vazirmatn-RD-ExtraLight.ttf
+!data/fonts/SamimFD-Regular.ttf
+!data/fonts/SahelFD-Black.ttf
+!data/fonts/TanhaFD-Regular.ttf
+!data/fonts/Vazirmatn-RD-Black.ttf
+!data/fonts/VazirCodeHackExtraHeightFD-Regular.ttf
+!data/fonts/ShabnamFD-Thin.ttf
+!data/fonts/SahelFD-Regular.ttf
+!data/fonts/Vazirmatn-ExtraBold.ttf
+!data/fonts/ReemKufiInk.ttf
 
 # editor, os cache directory
 .vscode/

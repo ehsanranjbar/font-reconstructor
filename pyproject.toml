@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "font-reconstructor"
 version = "0.1.0"
-description = "Autoencoder that reconstructs a font's glyph fingerprint from a rendered text image"
+description = "Identifies Persian fonts, also unseen ones, from an image of a few words, and reconstructs their glyphs"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.9"
